@@ -85,6 +85,12 @@ STALE_PROCESSING_BUFFER_QUIET_S = 3.0
 STALE_PROCESSING_CONFIRM_TTL_S = 2 * STALE_PROCESSING_CAPTURE_INTERVAL_S
 
 
+#: Rate limit for pyte feed-failure WARNINGs (per terminal). A CLI that emits a
+#: private CSI pyte cannot dispatch (see _feed_screen_locked) does so on every
+#: chunk until the sequence scrolls by; without the throttle each one would log.
+FEED_FAILURE_LOG_INTERVAL_S = 60.0
+
+
 class StatusMonitor:
     """Accumulates terminal output into rolling buffers and detects status changes."""
 
@@ -156,6 +162,11 @@ class StatusMonitor:
         # keeps status flap-free.
         self._screens: Dict[str, Tuple["pyte.Screen", "pyte.Stream"]] = {}
         self._bursting: Dict[str, bool] = {}
+        # Per-terminal (suppressed_count, last_warning_monotonic) for pyte feed
+        # failures. Key absence means "never failed" (the same None-vs-0.0
+        # sentinel rule as _last_stale_capture_check: monotonic's reference
+        # point is arbitrary, so a 0.0 initial timestamp is unusable).
+        self._feed_failures: Dict[str, Tuple[int, float]] = {}
         # Pending quiescence-detect timer handle per terminal (loop.call_later).
         self._quiesce_handle: Dict[str, asyncio.TimerHandle] = {}
         # The event loop that owns the quiescence timers. Captured when the
@@ -352,7 +363,55 @@ class StatusMonitor:
             stream = pyte.Stream(screen)
             scr = (screen, stream)
             self._screens[terminal_id] = scr
-        scr[1].feed(chunk)
+        try:
+            scr[1].feed(chunk)
+        except Exception as exc:
+            # pyte (0.8.2; selectel/pyte#209, unfixed upstream) passes
+            # ``private=True`` for any ``?``-prefixed CSI sequence, but most
+            # Screen handlers reject that kwarg — so a private CSI like Kimi
+            # Code's one-shot startup query ``CSI ? 996 n`` raises TypeError
+            # out of feed(). Swallowing it here keeps the chunk's remaining
+            # processing (detection scheduling in _process_chunk) alive; pyte
+            # resets its own parser FSM after a dispatch failure, so the
+            # stream stays usable for later chunks. The guard is deliberately
+            # handler-generic: any dispatch failure, any provider.
+            self._note_feed_failure(terminal_id, exc)
+
+    def _note_feed_failure(self, terminal_id: str, exc: Exception) -> None:
+        """Log a pyte feed failure, throttled per terminal. Caller holds the lock.
+
+        The first failure per terminal logs a WARNING immediately; repeats
+        within :data:`FEED_FAILURE_LOG_INTERVAL_S` log nothing and are counted,
+        and the next warning reports how many were suppressed. A terminal whose
+        CLI emits an undispatchable private CSI on every chunk therefore cannot
+        spam the log.
+        """
+        now = time.monotonic()
+        entry = self._feed_failures.get(terminal_id)
+        if entry is None:
+            logger.warning(
+                "pyte screen feed failed for terminal %s; skipped this chunk's "
+                "screen update (%s: %s)",
+                terminal_id,
+                type(exc).__name__,
+                exc,
+            )
+            self._feed_failures[terminal_id] = (0, now)
+            return
+        suppressed, last_warning = entry
+        if now - last_warning >= FEED_FAILURE_LOG_INTERVAL_S:
+            logger.warning(
+                "pyte screen feed failed for terminal %s; skipped this chunk's "
+                "screen update (%s: %s) — %d further failures suppressed since "
+                "the last warning",
+                terminal_id,
+                type(exc).__name__,
+                exc,
+                suppressed,
+            )
+            self._feed_failures[terminal_id] = (0, now)
+        else:
+            self._feed_failures[terminal_id] = (suppressed + 1, last_warning)
 
     def _screen_lines(self, terminal_id: str) -> Tuple[Optional[List[str]], str]:
         """Render the terminal's composited pyte screen under the lock.
@@ -708,6 +767,7 @@ class StatusMonitor:
             self._midburst_probe_at.pop(terminal_id, None)
             self._screens.pop(terminal_id, None)
             self._bursting.pop(terminal_id, None)
+            self._feed_failures.pop(terminal_id, None)
             self._last_stale_capture_check.pop(terminal_id, None)
             self._buffer_changed_at.pop(terminal_id, None)
             self._pending_stale_capture.pop(terminal_id, None)
@@ -733,6 +793,7 @@ class StatusMonitor:
             # detected against a fresh viewport, not the failed attempt's.
             self._screens.pop(terminal_id, None)
             self._bursting.pop(terminal_id, None)
+            self._feed_failures.pop(terminal_id, None)
             self._last_stale_capture_check.pop(terminal_id, None)
             self._buffer_changed_at.pop(terminal_id, None)
             self._pending_stale_capture.pop(terminal_id, None)

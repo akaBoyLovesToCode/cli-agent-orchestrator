@@ -6,6 +6,7 @@ backends (tmux) it returns the pushed pipeline status; for event-inbox backends
 provider's native status. These tests pin both paths.
 """
 
+import logging
 import threading
 import time
 from unittest.mock import MagicMock, patch
@@ -1409,3 +1410,116 @@ class TestMidBurstProcessingProbe:
         sm._bursting["t1"] = True
         sm._schedule_screen_detection("t1", provider)
         assert sm._last_status["t1"] == TerminalStatus.PROCESSING
+
+
+class TestPyteFeedFailure:
+    """pyte private-CSI dispatch failures must not abort chunk processing.
+
+    pyte 0.8.2 (selectel/pyte#209, unfixed upstream) passes ``private=True``
+    for any ``?``-prefixed CSI sequence, but most Screen handlers reject that
+    kwarg — Kimi Code emits ``CSI ? 996 n`` once at startup, which raised
+    ``TypeError`` out of ``_feed_screen_locked``, killing that chunk's screen
+    update AND skipping detection scheduling for the chunk (only run()'s
+    catch-all kept the monitor alive). The guard swallows the dispatch
+    failure — pyte resets its own parser FSM after one, so the stream stays
+    usable for later chunks — and rate-limits the WARNING to one per terminal
+    per :data:`FEED_FAILURE_LOG_INTERVAL_S`, reporting the suppressed count.
+    """
+
+    @staticmethod
+    def _screen_provider(status=TerminalStatus.PROCESSING):
+        provider = MagicMock()
+        provider.supports_screen_detection = True
+        provider.get_status_from_screen.return_value = status
+        return provider
+
+    @staticmethod
+    def _monitor():
+        """A StatusMonitor with a spy wrapped around _schedule_screen_detection."""
+        sm = StatusMonitor()
+        scheduled = []
+        original = sm._schedule_screen_detection
+        sm._schedule_screen_detection = lambda tid, prov: (
+            scheduled.append(tid),
+            original(tid, prov),
+        )
+        return sm, scheduled
+
+    @staticmethod
+    def _rendered(sm):
+        return "\n".join(sm._screens["t1"][0].display)
+
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    def test_private_csi_device_status_does_not_abort_chunk(self, mock_pm, caplog):
+        """Kimi Code's ``CSI ? 996 n`` (report_device_status) — the live bug."""
+        provider = self._screen_provider()
+        mock_pm.get_provider.return_value = provider
+        sm, scheduled = self._monitor()
+
+        with caplog.at_level(logging.WARNING):
+            sm._process_chunk("t1", "some text\x1b[?996n")  # must not raise
+
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1
+        assert "t1" in warnings[0].getMessage()
+
+        # Detection was still scheduled for the chunk (and ran inline — no
+        # event loop in a unit test), not skipped with the screen update.
+        assert scheduled == ["t1"]
+        provider.get_status_from_screen.assert_called_once()
+        assert sm._last_status["t1"] == TerminalStatus.PROCESSING
+
+        # pyte resets its own parser after a dispatch failure, so the stream
+        # stays usable: a later normal chunk still updates the screen.
+        sm._process_chunk("t1", "\r\nhello after failure")
+        assert "some text" in self._rendered(sm)
+        assert "hello after failure" in self._rendered(sm)
+
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    def test_private_csi_select_graphic_rendition_does_not_abort_chunk(self, mock_pm, caplog):
+        """A DIFFERENT vulnerable handler — the guard is handler-generic."""
+        provider = self._screen_provider()
+        mock_pm.get_provider.return_value = provider
+        sm, scheduled = self._monitor()
+
+        with caplog.at_level(logging.WARNING):
+            sm._process_chunk("t1", "plain\x1b[?5m")  # must not raise
+
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1
+        assert scheduled == ["t1"]
+
+        sm._process_chunk("t1", " still works")
+        assert "plain still works" in self._rendered(sm)
+
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    def test_repeated_failures_log_once_per_interval(self, mock_pm, caplog):
+        provider = self._screen_provider()
+        mock_pm.get_provider.return_value = provider
+        sm, _ = self._monitor()
+
+        with caplog.at_level(logging.WARNING):
+            sm._process_chunk("t1", "a\x1b[?996n")
+            sm._process_chunk("t1", "b\x1b[?996n")
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1
+
+        # Past the interval the next failure logs again, reporting the
+        # suppressed count (state aged artificially, like _quiet_since()).
+        sm._feed_failures["t1"] = (1, -1000.0)
+        caplog.clear()
+        with caplog.at_level(logging.WARNING):
+            sm._process_chunk("t1", "c\x1b[?996n")
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1
+        assert "1 further failures suppressed" in warnings[0].getMessage()
+
+    def test_clear_terminal_and_reset_buffer_drop_throttle_state(self):
+        sm = StatusMonitor()
+        sm._feed_failures["t1"] = (3, 123.0)
+        sm.clear_terminal("t1")
+        assert "t1" not in sm._feed_failures
+
+        sm._feed_failures["t1"] = (3, 123.0)
+        sm.reset_buffer("t1")
+        assert "t1" not in sm._feed_failures
