@@ -1125,6 +1125,18 @@ def is_idle_tip_line(clean_line: str, raw_line: str = "") -> bool:
     return bool(_TIP_RE.search(clean_line))
 
 
+def is_turn_indicator_row(clean_line: str) -> bool:
+    """True for a moon-phase-prefixed row — the content of Kimi Code's turn
+    indicator slot (the row directly above the composer box).
+
+    Kimi Code 2.1.0 keeps the slot occupied for the whole turn: the rotating
+    ``🌓 · Tip: …`` row, or a bare phase glyph while the tip text rotates.
+    Measured on archived 2.1.0 terminals (mid-turn frames of CAO terminals
+    d9b7ac19 / b0210430 vs the completed frame of 059bec94).
+    """
+    return bool(_MOON_PREFIX_RE.match(clean_line))
+
+
 def is_legacy_idle_prompt_line(
     clean_line: str,
     semantics: SpinnerSemantics = SpinnerSemantics.LEGACY,

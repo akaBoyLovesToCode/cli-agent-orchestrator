@@ -4285,3 +4285,87 @@ class TestP2ReviewPublicOutputPath:
     def test_legacy_final_idle_prompt_is_absent(self, monkeypatch):
         pane = "\n".join(["💫 What is two plus two?", "• Four.", "💫", ""])
         assert self._get_last(monkeypatch, pane) == "• Four."
+
+
+class TestCodeTurnIndicatorSlot:
+    """Kimi Code 2.1.0 turn-indicator slot — the false-COMPLETED regression.
+
+    Kimi Code 2.1.0 keeps the row directly above the composer box top border
+    (``╭─…``) occupied for the ENTIRE turn: the rotating moon tip row
+    (``🌓 · Tip: …``), or a bare phase glyph (``🌗``) while the tip text
+    rotates. On a settled frame the slot is empty only when the turn has
+    actually finished. The response-bullet heuristic alone could not see
+    this: 2.1.0 also draws ``●`` bullets for tool results and plan
+    narration, so during a mid-turn thinking pause (no output, no braille
+    spinner) any existing bullet read COMPLETED while Kimi was still
+    streaming — which killed two real workers (terminals d9b7ac19 and
+    b0210430). Slot adjacency, not mere moon presence, is the rule: a moon
+    row quoted inside an answer is content (the A3-4 regression above).
+
+    Fixture provenance: frames obtained by replaying the archived raw CAO
+    terminal streams through pyte (Screen 400x200, the StatusMonitor's own
+    geometry) and extracting the non-blank display rows, then sanitized for
+    publication (task-prompt prose replaced with generic audit text, real
+    paths/symbols/session ids neutralised; terminal structure — bullet
+    glyphs, detail suffixes, box chrome, tip/moon rows, footers, leading
+    whitespace — preserved):
+
+    * ``kimi_code_210_mid_turn_tip.txt`` — terminal d9b7ac19 @byte 614000:
+      mid-turn thinking pause, ``🌓 · Tip:`` row in the slot.
+    * ``kimi_code_210_mid_turn_tool_in_flight.txt`` — terminal b0210430
+      @byte 48500: ``● Using Read (…)`` in flight, ``🌕 · Tip:`` in the slot.
+    * ``kimi_code_210_mid_turn_bare_moon_slot.txt`` — terminal b0210430
+      @byte 49000: bare ``🌗`` in the slot while the tip text rotates.
+    * ``kimi_code_210_turn_completed.txt`` — terminal 059bec94 @byte 139000:
+      genuine final answer; no moon row anywhere, the slot is empty.
+    * ``kimi_code_210_fresh_idle.txt`` — terminal d9b7ac19 @byte 8000:
+      fresh pre-prompt idle; no composer, no moon.
+    """
+
+    @pytest.mark.parametrize(
+        "fixture_name,expected",
+        [
+            ("kimi_code_210_mid_turn_tip.txt", TerminalStatus.PROCESSING),
+            ("kimi_code_210_mid_turn_tool_in_flight.txt", TerminalStatus.PROCESSING),
+            ("kimi_code_210_mid_turn_bare_moon_slot.txt", TerminalStatus.PROCESSING),
+            ("kimi_code_210_turn_completed.txt", TerminalStatus.COMPLETED),
+            ("kimi_code_210_fresh_idle.txt", TerminalStatus.IDLE),
+        ],
+    )
+    def test_replayed_210_frames_classify_correctly(self, fixture_name, expected):
+        rows = [ln for ln in _fixture(fixture_name).split("\n") if ln.strip()]
+        assert _code_provider(f"slot-{fixture_name}").get_status_from_screen(rows) is expected
+
+    def test_tip_row_in_the_slot_means_processing(self):
+        """Slot adjacency: the tip row directly above the composer border."""
+
+        rows = [
+            "✨ summarise the findings",
+            "● The answer is 4.",
+            "🌕 · Tip: use ctrl-o to expand tool output",
+            "╭────────────────────╮",
+            "│ >                  │",
+            "╰────────────────────╯",
+            "context: 2% (18.5k/977k)",
+        ]
+        assert (
+            _code_provider("slot-adjacent").get_status_from_screen(rows)
+            is TerminalStatus.PROCESSING
+        )
+
+    def test_tip_row_mid_transcript_is_not_the_slot(self):
+        """The same tip row NOT above a composer border is answer content."""
+
+        rows = [
+            "✨ summarise the findings",
+            "🌕 · Tip: use ctrl-o to expand tool output",
+            "● The answer is 4.",
+            "╭────────────────────╮",
+            "│ >                  │",
+            "╰────────────────────╯",
+            "context: 2% (18.5k/977k)",
+        ]
+        assert (
+            _code_provider("slot-mid-transcript").get_status_from_screen(rows)
+            is TerminalStatus.COMPLETED
+        )

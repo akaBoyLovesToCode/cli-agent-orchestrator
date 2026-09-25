@@ -533,7 +533,16 @@ Two independent paths exist and must agree:
 - `get_status_from_screen(screen_lines)` — a pyte-composited viewport of
   **escape-free** rows. Enabled via `supports_screen_detection = True` /
   `CAO_PYTE_STATUS`. Because the rows carry no styling, no rule here may depend
-  on ANSI.
+  on ANSI. Under CODE semantics this path additionally reads the
+  **turn-indicator slot**: Kimi Code 2.1.0 keeps the row directly above the
+  composer box top border (`╭─…`) occupied for the entire turn — the rotating
+  moon tip row, or a bare phase glyph while the tip text rotates — and a
+  settled frame shows it empty only when the turn has actually finished. An
+  occupied slot is therefore PROCESSING evidence that outranks the
+  response-bullet heuristic (2.1.0 draws `●` bullets for tool results and
+  plan narration too, so a mid-turn thinking pause can show bullets while
+  still streaming). Composer adjacency is what separates the slot from a moon
+  row quoted inside an answer, which stays content.
 
 A response bullet latches "input received", so a long response that scrolls its
 bullets out of the buffer still reads COMPLETED rather than IDLE. Nothing

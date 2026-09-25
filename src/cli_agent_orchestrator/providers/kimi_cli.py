@@ -681,6 +681,27 @@ def _is_live_turn_spinner_line(
     return kt.is_live_spinner_line(kt.strip_sgr(line), line, semantics)
 
 
+#: Top border of the Kimi Code composer box (``╭─…``), optionally indented.
+_COMPOSER_TOP_RE = re.compile(r"^[^\S\n]*╭")
+
+
+def _turn_indicator_slot_occupied(rows: List[str]) -> bool:
+    """True when Kimi Code's turn-indicator slot is occupied.
+
+    The slot is the row directly above the composer box top border (``╭─…``).
+    It stays occupied (rotating moon tip row, or a bare phase glyph while the
+    tip text rotates) for the entire turn; a settled frame shows it empty only
+    when the turn has actually finished, so an occupied slot is positive
+    turn-in-flight evidence that outranks the response-bullet heuristic.
+    Composer adjacency is what separates the slot from a moon row quoted
+    inside an answer (A3-4 regression).
+    """
+    for i, ln in enumerate(rows[:-1]):
+        if kt.is_turn_indicator_row(ln) and _COMPOSER_TOP_RE.match(rows[i + 1]):
+            return True
+    return False
+
+
 # Response markers.
 #
 # There is deliberately no locally-defined bullet regex here any more. The
@@ -2273,6 +2294,16 @@ class KimiCliProvider(BaseProvider):
         window): a spinner visible in the rendered pane tail is unambiguously
         live, and the response bullets are present without eviction. Called by
         the StatusMonitor only on settled / rising-edge frames.
+
+        A spinner is positive in-flight evidence, but its ABSENCE is not proof
+        of a finished turn: Kimi Code 2.1.0 draws ``●`` bullets for tool
+        results and plan narration too, so a mid-turn thinking pause (no
+        output, no braille spinner) can show bullets while the turn is still
+        streaming. Under CODE semantics the turn-indicator slot — the row
+        directly above the composer box top border, which 2.1.0 keeps occupied
+        (rotating moon tip row, or a bare phase glyph while the tip rotates)
+        for the entire turn — therefore outranks the response-bullet heuristic
+        (see ``_turn_indicator_slot_occupied``).
         """
         rows = [ln.rstrip() for ln in screen_lines if ln.strip()]
         if not rows:
@@ -2309,6 +2340,16 @@ class KimiCliProvider(BaseProvider):
         if re.search(NEW_TUI_STATUS_PATTERN, joined):
             semantics = self._spinner_semantics()
             if any(_is_live_turn_spinner_line(ln, semantics) for ln in tail):
+                return TerminalStatus.PROCESSING
+            # Kimi Code 2.1.0 keeps the turn-indicator slot (the row directly
+            # above the composer box top border) occupied for the whole turn —
+            # rotating moon tip row, or a bare phase glyph while the tip text
+            # rotates. A response bullet is NOT turn-finished evidence there:
+            # tool results and plan narration draw the same ``●`` glyph, so a
+            # mid-turn thinking pause (no output, no braille spinner) would
+            # otherwise read COMPLETED while the turn is still streaming
+            # (measured on archived 2.1.0 terminals d9b7ac19 / b0210430).
+            if semantics is kt.SpinnerSemantics.CODE and _turn_indicator_slot_occupied(rows):
                 return TerminalStatus.PROCESSING
             if re.search(ERROR_PATTERN, joined, re.MULTILINE):
                 return TerminalStatus.ERROR

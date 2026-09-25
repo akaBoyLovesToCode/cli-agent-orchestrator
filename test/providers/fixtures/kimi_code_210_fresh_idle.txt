@@ -1,0 +1,11 @@
+ │  Session:   session_00000000-0000-0000-0000-000000000000               │
+ │  Model:     K3-256k                                                    │
+ │  Version:   2.1.0                                                      │
+ │  MCP:       1 connected                                                │
+ │                                                                        │
+ ╰────────────────────────────────────────────────────────────────────────╯
+ ✦ Kimi Code Desktop is here — Everything you love about Kimi Code, now on
+                             desktop
+   Run /desktop or visit https://www.kimi.com/code to install
+ Never Ask  K3-256k thinking: max  …/repo/audit-target  ui…
+                                                       context: 0% (0/256k)
