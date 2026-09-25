@@ -18,11 +18,12 @@ class TestCreateTerminalProviderResolution:
         return_value=None,
     )
     @patch(
-        "cli_agent_orchestrator.utils.orchestration.resolve_provider", return_value="claude_code"
+        "cli_agent_orchestrator.utils.orchestration._resolve_worker_provider",
+        return_value="claude_code",
     )
     @patch("cli_agent_orchestrator.utils.orchestration.requests")
     def test_existing_session_respects_child_profile_provider(
-        self, mock_requests, mock_resolve_provider, mock_allowed_tools
+        self, mock_requests, mock_resolve_worker_provider, mock_allowed_tools
     ):
         """Worker profile provider should override the supervisor provider."""
         from cli_agent_orchestrator.utils.orchestration import _create_terminal
@@ -47,7 +48,9 @@ class TestCreateTerminalProviderResolution:
 
         assert terminal_id == "worker-1"
         assert provider == "claude_code"
-        mock_resolve_provider.assert_called_once_with("reviewer", fallback_provider="kiro_cli")
+        mock_resolve_worker_provider.assert_called_once_with(
+            "reviewer", fallback_provider="kiro_cli"
+        )
         mock_requests.post.assert_called_once_with(
             f"{API_BASE_URL}/sessions/cao-session/terminals",
             params={
@@ -65,10 +68,13 @@ class TestCreateTerminalProviderResolution:
         "cli_agent_orchestrator.utils.orchestration._resolve_child_allowed_tools",
         return_value=None,
     )
-    @patch("cli_agent_orchestrator.utils.orchestration.resolve_provider", return_value="kiro_cli")
+    @patch(
+        "cli_agent_orchestrator.utils.orchestration._resolve_worker_provider",
+        return_value="kiro_cli",
+    )
     @patch("cli_agent_orchestrator.utils.orchestration.requests")
     def test_existing_session_falls_back_to_supervisor_provider(
-        self, mock_requests, mock_resolve_provider, mock_allowed_tools
+        self, mock_requests, mock_resolve_worker_provider, mock_allowed_tools
     ):
         """Worker without a provider should inherit the supervisor provider."""
         from cli_agent_orchestrator.utils.orchestration import _create_terminal
@@ -93,7 +99,9 @@ class TestCreateTerminalProviderResolution:
 
         assert terminal_id == "worker-2"
         assert provider == "kiro_cli"
-        mock_resolve_provider.assert_called_once_with("reviewer", fallback_provider="kiro_cli")
+        mock_resolve_worker_provider.assert_called_once_with(
+            "reviewer", fallback_provider="kiro_cli"
+        )
         mock_requests.post.assert_called_once_with(
             f"{API_BASE_URL}/sessions/cao-session/terminals",
             params={
@@ -111,10 +119,12 @@ class TestCreateTerminalProviderResolution:
         "cli_agent_orchestrator.utils.orchestration._resolve_child_allowed_tools",
         return_value=None,
     )
-    @patch("cli_agent_orchestrator.utils.orchestration.resolve_provider", return_value="mcode")
+    @patch(
+        "cli_agent_orchestrator.utils.orchestration._resolve_worker_provider", return_value="mcode"
+    )
     @patch("cli_agent_orchestrator.utils.orchestration.requests")
     def test_mcode_worker_omits_kiro_engine_and_forwards_model(
-        self, mock_requests, mock_resolve_provider, mock_allowed_tools
+        self, mock_requests, mock_resolve_worker_provider, mock_allowed_tools
     ):
         """MCode workers omit Kiro-only engine but receive a terminal-local model."""
         from cli_agent_orchestrator.models.inbox import OrchestrationType
@@ -157,10 +167,13 @@ class TestCreateTerminalProviderResolution:
         "cli_agent_orchestrator.utils.orchestration._resolve_child_allowed_tools",
         return_value=None,
     )
-    @patch("cli_agent_orchestrator.utils.orchestration.resolve_provider", return_value="kiro_cli")
+    @patch(
+        "cli_agent_orchestrator.utils.orchestration._resolve_worker_provider",
+        return_value="kiro_cli",
+    )
     @patch("cli_agent_orchestrator.utils.orchestration.requests")
     def test_child_engine_is_explicit_not_inherited(
-        self, mock_requests, _mock_resolve_provider, _mock_allowed_tools
+        self, mock_requests, _mock_resolve_worker_provider, _mock_allowed_tools
     ):
         """A parent KAS value does not become an implicit child engine."""
         from cli_agent_orchestrator.utils.orchestration import _create_terminal
@@ -194,12 +207,12 @@ class TestCreateTerminalProviderResolution:
         return_value="cao-new-session",
     )
     @patch(
-        "cli_agent_orchestrator.utils.orchestration.resolve_provider",
+        "cli_agent_orchestrator.utils.orchestration._resolve_worker_provider",
         return_value="codex",
     )
     @patch("cli_agent_orchestrator.utils.orchestration.requests")
     def test_new_session_forwards_model_and_initial_message(
-        self, mock_requests, mock_resolve_provider, mock_generate_session_name
+        self, mock_requests, mock_resolve_worker_provider, mock_generate_session_name
     ):
         """The no-current-terminal branch no longer drops either launch field."""
         from cli_agent_orchestrator.models.inbox import OrchestrationType
@@ -242,12 +255,12 @@ class TestCreateTerminalProviderResolution:
         return_value="cao-new-session",
     )
     @patch(
-        "cli_agent_orchestrator.utils.orchestration.resolve_provider",
+        "cli_agent_orchestrator.utils.orchestration._resolve_worker_provider",
         return_value="codex",
     )
     @patch("cli_agent_orchestrator.utils.orchestration.requests")
     def test_new_session_initial_message_is_forwarded_without_defer_flag(
-        self, mock_requests, mock_resolve_provider, mock_generate_session_name
+        self, mock_requests, mock_resolve_worker_provider, mock_generate_session_name
     ):
         """An initial message cannot be dropped when defer_init keeps its default."""
         from cli_agent_orchestrator.utils.orchestration import _create_terminal
@@ -291,12 +304,13 @@ class TestCreateTerminalProviderResolution:
         return_value=None,
     )
     @patch(
-        "cli_agent_orchestrator.utils.orchestration.resolve_provider", return_value="claude_code"
+        "cli_agent_orchestrator.utils.orchestration._resolve_worker_provider",
+        return_value="claude_code",
     )
     @patch("cli_agent_orchestrator.utils.orchestration.get_local_bearer", return_value="tok")
     @patch("cli_agent_orchestrator.utils.orchestration.requests")
     def test_attaches_bearer_when_auth_enabled(
-        self, mock_requests, _bearer, mock_resolve_provider, mock_allowed_tools
+        self, mock_requests, _bearer, mock_resolve_worker_provider, mock_allowed_tools
     ):
         """Review on PR #634: both the metadata GET and the create POST carry
         the local bearer when configured -- covers the assign/handoff path."""
@@ -333,11 +347,12 @@ class TestCreateTerminalModelOverride:
         return_value=None,
     )
     @patch(
-        "cli_agent_orchestrator.utils.orchestration.resolve_provider", return_value="claude_code"
+        "cli_agent_orchestrator.utils.orchestration._resolve_worker_provider",
+        return_value="claude_code",
     )
     @patch("cli_agent_orchestrator.utils.orchestration.requests")
     def test_model_is_forwarded_as_a_param(
-        self, mock_requests, mock_resolve_provider, mock_allowed_tools
+        self, mock_requests, mock_resolve_worker_provider, mock_allowed_tools
     ):
         from cli_agent_orchestrator.utils.orchestration import _create_terminal
 
@@ -365,11 +380,12 @@ class TestCreateTerminalModelOverride:
         return_value=None,
     )
     @patch(
-        "cli_agent_orchestrator.utils.orchestration.resolve_provider", return_value="claude_code"
+        "cli_agent_orchestrator.utils.orchestration._resolve_worker_provider",
+        return_value="claude_code",
     )
     @patch("cli_agent_orchestrator.utils.orchestration.requests")
     def test_omitted_model_leaves_params_unchanged(
-        self, mock_requests, mock_resolve_provider, mock_allowed_tools
+        self, mock_requests, mock_resolve_worker_provider, mock_allowed_tools
     ):
         """No model given -> params dict is byte-for-byte the pre-fix shape
         (no 'model' key at all) -- existing callers see zero behavior change."""
@@ -407,11 +423,12 @@ class TestCreateTerminalUseWorktree:
         return_value=None,
     )
     @patch(
-        "cli_agent_orchestrator.utils.orchestration.resolve_provider", return_value="claude_code"
+        "cli_agent_orchestrator.utils.orchestration._resolve_worker_provider",
+        return_value="claude_code",
     )
     @patch("cli_agent_orchestrator.utils.orchestration.requests")
     def test_use_worktree_true_is_included_in_params(
-        self, mock_requests, mock_resolve_provider, mock_allowed_tools
+        self, mock_requests, mock_resolve_worker_provider, mock_allowed_tools
     ):
         from cli_agent_orchestrator.utils.orchestration import _create_terminal
 
@@ -439,11 +456,12 @@ class TestCreateTerminalUseWorktree:
         return_value=None,
     )
     @patch(
-        "cli_agent_orchestrator.utils.orchestration.resolve_provider", return_value="claude_code"
+        "cli_agent_orchestrator.utils.orchestration._resolve_worker_provider",
+        return_value="claude_code",
     )
     @patch("cli_agent_orchestrator.utils.orchestration.requests")
     def test_use_worktree_false_is_omitted_from_params(
-        self, mock_requests, mock_resolve_provider, mock_allowed_tools
+        self, mock_requests, mock_resolve_worker_provider, mock_allowed_tools
     ):
         """Default False = today's exact behavior unchanged -- no new query
         param reaches the server for a caller that never mentions it."""
@@ -473,12 +491,12 @@ class TestCreateTerminalUseWorktree:
         return_value="cao-new-session",
     )
     @patch(
-        "cli_agent_orchestrator.utils.orchestration.resolve_provider",
+        "cli_agent_orchestrator.utils.orchestration._resolve_worker_provider",
         return_value="claude_code",
     )
     @patch("cli_agent_orchestrator.utils.orchestration.requests")
     def test_use_worktree_true_reaches_new_session_params_too(
-        self, mock_requests, mock_resolve_provider, mock_generate_session_name
+        self, mock_requests, mock_resolve_worker_provider, mock_generate_session_name
     ):
         """Regression (review on PR #634): a fresh-session caller (no
         CAO_TERMINAL_ID -- e.g. `cao agent handoff --use-worktree` run outside
@@ -504,12 +522,12 @@ class TestCreateTerminalUseWorktree:
         return_value="cao-new-session",
     )
     @patch(
-        "cli_agent_orchestrator.utils.orchestration.resolve_provider",
+        "cli_agent_orchestrator.utils.orchestration._resolve_worker_provider",
         return_value="claude_code",
     )
     @patch("cli_agent_orchestrator.utils.orchestration.requests")
     def test_use_worktree_false_omitted_from_new_session_params(
-        self, mock_requests, mock_resolve_provider, mock_generate_session_name
+        self, mock_requests, mock_resolve_worker_provider, mock_generate_session_name
     ):
         """Default False = today's exact behavior unchanged for the
         new-session branch too."""
@@ -531,11 +549,12 @@ class TestCreateTerminalUseWorktree:
         return_value=None,
     )
     @patch(
-        "cli_agent_orchestrator.utils.orchestration.resolve_provider", return_value="claude_code"
+        "cli_agent_orchestrator.utils.orchestration._resolve_worker_provider",
+        return_value="claude_code",
     )
     @patch("cli_agent_orchestrator.utils.orchestration.requests")
     def test_idempotency_key_reaches_existing_session_params(
-        self, mock_requests, mock_resolve_provider, mock_allowed_tools
+        self, mock_requests, mock_resolve_worker_provider, mock_allowed_tools
     ):
         """Review on PR #634, issue #616."""
         from cli_agent_orchestrator.utils.orchestration import _create_terminal
@@ -564,12 +583,12 @@ class TestCreateTerminalUseWorktree:
         return_value="cao-new-session",
     )
     @patch(
-        "cli_agent_orchestrator.utils.orchestration.resolve_provider",
+        "cli_agent_orchestrator.utils.orchestration._resolve_worker_provider",
         return_value="claude_code",
     )
     @patch("cli_agent_orchestrator.utils.orchestration.requests")
     def test_idempotency_key_reaches_new_session_params(
-        self, mock_requests, mock_resolve_provider, mock_generate_session_name
+        self, mock_requests, mock_resolve_worker_provider, mock_generate_session_name
     ):
         """Review on PR #634, issue #616."""
         from cli_agent_orchestrator.utils.orchestration import _create_terminal
@@ -586,12 +605,12 @@ class TestCreateTerminalUseWorktree:
         assert kwargs["params"]["idempotency_key"] == "retry-1"
 
     @patch(
-        "cli_agent_orchestrator.utils.orchestration.resolve_provider",
+        "cli_agent_orchestrator.utils.orchestration._resolve_worker_provider",
         return_value="claude_code",
     )
     @patch("cli_agent_orchestrator.utils.orchestration.requests")
     def test_two_keyed_fresh_session_retries_send_the_same_session_name(
-        self, mock_requests, mock_resolve_provider
+        self, mock_requests, mock_resolve_worker_provider
     ):
         """A keyed retry outside a CAO terminal must reattach, not 409.
 
@@ -627,12 +646,12 @@ class TestCreateTerminalUseWorktree:
         assert mock_requests.post.call_args.kwargs["params"]["session_name"] != sent[0]
 
     @patch(
-        "cli_agent_orchestrator.utils.orchestration.resolve_provider",
+        "cli_agent_orchestrator.utils.orchestration._resolve_worker_provider",
         return_value="claude_code",
     )
     @patch("cli_agent_orchestrator.utils.orchestration.requests")
     def test_unkeyed_fresh_sessions_still_get_unique_names(
-        self, mock_requests, mock_resolve_provider
+        self, mock_requests, mock_resolve_worker_provider
     ):
         """No key means the old uuid4 behaviour, unchanged.
 

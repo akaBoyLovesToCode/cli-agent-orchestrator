@@ -37,6 +37,7 @@ from cli_agent_orchestrator.constants import (
     CALLBACK_TERMINAL_ID_ENV,
     CALLBACK_URL_ENV,
     DEFAULT_PROVIDER,
+    PROVIDERS,
 )
 from cli_agent_orchestrator.mcp_server.models import HandoffResult
 from cli_agent_orchestrator.models.inbox import OrchestrationType
@@ -46,7 +47,7 @@ from cli_agent_orchestrator.services.elastic_worker_gateway import (
     elastic_worker_gateway_headers,
 )
 from cli_agent_orchestrator.services.settings_service import get_server_settings
-from cli_agent_orchestrator.utils.agent_profiles import resolve_provider
+from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
 from cli_agent_orchestrator.utils.terminal import (
     generate_session_name,
     generate_session_name_for_key,
@@ -341,6 +342,52 @@ def _cleanup_remote_terminal(base_url: str, terminal_id: str) -> bool:
         return False
 
 
+def _resolve_worker_provider(agent_profile: str, fallback_provider: str) -> str:
+    """Resolve the provider for an EXPLICITLY NAMED worker profile -- fail closed.
+
+    handoff/assign always name the child profile explicitly, so a profile that
+    cannot be LOADED (missing, unreadable, malformed) must never inherit the
+    supervisor's or the default provider: that silent inheritance is what
+    launched a ``codex --yolo`` worker when a ``kimi_cli`` profile lookup
+    failed. Raise instead; the caller turns that into an explicit failure
+    result before any terminal is created or any run-step is issued.
+
+    Inheritance of ``fallback_provider`` applies only when the profile loads
+    successfully and legitimately OMITS the provider key -- the documented
+    behavior ``resolve_provider`` has for that case. A loaded profile whose
+    provider value is not a known provider is a misconfiguration, not an
+    omission, and fails closed as well: inheriting there would be the same
+    silent-provider-swap bug with a typo'd key instead of a missing file.
+
+    Unlike ``utils.agent_profiles.resolve_provider`` -- which keeps its
+    documented warn-and-fallback contract for the legacy launch/session
+    surfaces -- this resolver is used only on the handoff/assign
+    worker-creation paths, where a fallback is never what the caller asked for.
+
+    Raises:
+        ValueError: the profile could not be loaded, or it declares a provider
+            that is not a known provider.
+    """
+    try:
+        profile = load_agent_profile(agent_profile)
+    except (FileNotFoundError, RuntimeError, ValueError) as exc:
+        raise ValueError(
+            f"agent profile '{agent_profile}' could not be loaded ({exc}); "
+            "refusing to fall back to the inherited/default provider for an "
+            "explicitly named profile -- no worker was launched"
+        ) from exc
+    if profile.provider:
+        if profile.provider in PROVIDERS:
+            return profile.provider
+        raise ValueError(
+            f"agent profile '{agent_profile}' declares invalid provider "
+            f"'{profile.provider}' (valid providers: {PROVIDERS}); refusing to "
+            "fall back to the inherited/default provider for an explicitly "
+            "named profile -- no worker was launched"
+        )
+    return fallback_provider
+
+
 def _resolve_child_allowed_tools(
     parent_allowed_tools: Optional[list], child_profile_name: str
 ) -> Optional[str]:
@@ -469,7 +516,11 @@ def _create_terminal(
         terminal_metadata = response.json()
 
         # Treat the supervisor provider as a fallback, not an explicit override.
-        provider = resolve_provider(agent_profile, fallback_provider=terminal_metadata["provider"])
+        # Fail-closed (see _resolve_worker_provider): an explicit child profile
+        # that cannot be loaded raises here, before any terminal is created.
+        provider = _resolve_worker_provider(
+            agent_profile, fallback_provider=terminal_metadata["provider"]
+        )
         session_name = terminal_metadata["session_name"]
         parent_allowed_tools = terminal_metadata.get("allowed_tools")
 
@@ -571,7 +622,7 @@ def _create_terminal(
             if idempotency_key
             else generate_session_name()
         )
-        provider = resolve_provider(agent_profile, fallback_provider=provider)
+        provider = _resolve_worker_provider(agent_profile, fallback_provider=provider)
         params = {
             "provider": provider,
             "agent_profile": agent_profile,
@@ -708,6 +759,11 @@ def _resolve_handoff_provider(agent_profile: str) -> HandoffContext:
     profile. When NOT run inside a CAO terminal there is no supervisor: a fresh
     session is auto-created (``session_name=None``) and no caller is recorded.
 
+    Provider resolution is FAIL-CLOSED (``_resolve_worker_provider``): the
+    profile is always explicitly named here, so a profile that fails to load
+    raises instead of silently inheriting the supervisor/default provider --
+    the failure surfaces before any terminal exists or any run-step is sent.
+
     This lets the codex fast-fail and codex prompt-shaping run caller-side before
     the single combined run-step call, while preserving the same-session /
     caller_id / allowed_tools behavior the old six-call path had.
@@ -715,7 +771,7 @@ def _resolve_handoff_provider(agent_profile: str) -> HandoffContext:
     current_terminal_id = _current_terminal_id()
     if not current_terminal_id:
         return HandoffContext(
-            provider=resolve_provider(agent_profile, fallback_provider=DEFAULT_PROVIDER),
+            provider=_resolve_worker_provider(agent_profile, fallback_provider=DEFAULT_PROVIDER),
             session_name=None,
             caller_id=None,
             allowed_tools=None,
@@ -729,7 +785,9 @@ def _resolve_handoff_provider(agent_profile: str) -> HandoffContext:
     response.raise_for_status()
     terminal_metadata = response.json()
 
-    provider = resolve_provider(agent_profile, fallback_provider=terminal_metadata["provider"])
+    provider = _resolve_worker_provider(
+        agent_profile, fallback_provider=terminal_metadata["provider"]
+    )
     # Resolve the child's allowed-tools via the same inheritance the old path
     # used; _resolve_child_allowed_tools returns a comma-separated string (or
     # None for unrestricted), which we split into the list the payload expects.

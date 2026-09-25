@@ -13,6 +13,7 @@ from cli_agent_orchestrator.agent_plugins.mcp_delivery import with_plugin_mcp as
 from cli_agent_orchestrator.agent_plugins.mcp_mapping import CODEX_BARE_KEY
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.constants import CAO_HOME_DIR
+from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.services.settings_service import get_server_settings
@@ -888,6 +889,21 @@ class CodexProvider(BaseProvider):
                 profile = _with_plugin_mcp(load_agent_profile(self._agent_profile), "codex")
             except Exception as e:
                 raise ProviderError(f"Failed to load agent profile '{self._agent_profile}': {e}")
+            # Defense-in-depth, fail closed at the launch boundary: a loaded
+            # profile that explicitly declares a NON-codex provider must never
+            # be launched through Codex. Upstream resolution (orchestration's
+            # _resolve_worker_provider) already refuses to route such a profile
+            # to a codex terminal, but a terminal can also reach this provider
+            # with an explicit provider override -- if that pairing is wrong,
+            # the worker would otherwise run a foreign agent's prompt under
+            # `codex --yolo` with approvals and sandbox bypassed.
+            if profile.provider and profile.provider != ProviderType.CODEX.value:
+                raise ProviderError(
+                    f"Refusing to launch Codex for agent profile "
+                    f"'{self._agent_profile}': the profile declares provider "
+                    f"'{profile.provider}', not 'codex'. Create the terminal "
+                    f"with provider '{profile.provider}' instead."
+                )
 
         if profile and profile.codexProfile and not yolo:
             command_parts = ["codex", "--profile", profile.codexProfile]

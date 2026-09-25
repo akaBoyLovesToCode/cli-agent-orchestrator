@@ -394,6 +394,18 @@ def resolve_provider(agent_profile_name: str, fallback_provider: str) -> str:
     except (FileNotFoundError, RuntimeError):
         # Profile not found or failed to load — provider.initialize()
         # will surface a clear error later.  Fall back for now.
+        # NOTE: the handoff/assign worker-creation paths deliberately do NOT
+        # use this fallback -- they resolve through
+        # ``utils.orchestration._resolve_worker_provider``, which fails closed
+        # because an explicitly named child profile that cannot be loaded must
+        # never silently inherit the supervisor/default provider. This legacy
+        # fallback remains for the launch/session surfaces only; log it so the
+        # inheritance is at least observable.
+        logger.warning(
+            "Agent profile '%s' could not be loaded; falling back to provider '%s'.",
+            agent_profile_name,
+            fallback_provider,
+        )
         return fallback_provider
 
     if profile.provider:

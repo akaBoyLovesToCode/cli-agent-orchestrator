@@ -471,7 +471,7 @@ class TestResolveHandoffProvider:
     the provider) from the supervisor terminal metadata."""
 
     @patch("cli_agent_orchestrator.utils.orchestration._resolve_child_allowed_tools")
-    @patch("cli_agent_orchestrator.utils.orchestration.resolve_provider")
+    @patch("cli_agent_orchestrator.utils.orchestration._resolve_worker_provider")
     def test_inside_cao_terminal_extracts_context(self, mock_resolve, mock_child_tools):
         from cli_agent_orchestrator.utils.orchestration import _resolve_handoff_provider
 
@@ -496,7 +496,7 @@ class TestResolveHandoffProvider:
         assert ctx.caller_id == "c0ffee01"
         assert ctx.allowed_tools == ["fs_read", "fs_write"]
 
-    @patch("cli_agent_orchestrator.utils.orchestration.resolve_provider")
+    @patch("cli_agent_orchestrator.utils.orchestration._resolve_worker_provider")
     def test_outside_cao_terminal_yields_empty_context(self, mock_resolve):
         from cli_agent_orchestrator.utils.orchestration import _resolve_handoff_provider
 
