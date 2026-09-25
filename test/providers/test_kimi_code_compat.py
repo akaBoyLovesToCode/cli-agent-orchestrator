@@ -71,6 +71,7 @@ from cli_agent_orchestrator.providers.kimi_runtime_home import (
     read_user_mcp_servers,
     resolve_source_home,
 )
+from cli_agent_orchestrator.utils import pyte_ansi
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 
@@ -4369,3 +4370,126 @@ class TestCodeTurnIndicatorSlot:
             _code_provider("slot-mid-transcript").get_status_from_screen(rows)
             is TerminalStatus.COMPLETED
         )
+
+
+# =============================================================================
+# A4.4 — styled-screen discriminator (slot-empty gap / torn-frame false COMPLETED)
+# =============================================================================
+
+
+class TestCodeStyledScreenDiscriminator:
+    """Kimi Code 2.1.0 styled-screen detection — the second false-COMPLETED wave.
+
+    The turn-indicator slot rule (``TestCodeTurnIndicatorSlot``) covers frames
+    where the slot stays occupied. Two 2.1.0 frame shapes defeat every
+    plain-text rule, and both were observed killing a real worker:
+
+    * **Slot-empty gap**: the tip row is transiently ERASED while a tool diff
+      renders — composer fully visible, no spinner, no slot row — so the
+      monitor's 0.2s quiescence fires inside the gap and the plain path's
+      response-bullet heuristic reads COMPLETED mid-turn (smoke terminal
+      c25a4ee2, worker killed at 53.2s while an Edit diff was the trailing
+      turn content).
+    * **Footer-less torn frame**: the status bar is not yet repainted, so the
+      plain path falls through to the legacy sparkle branch, where the user's
+      own ✨ echo satisfies ``IDLE_PROMPT_PATTERN`` → COMPLETED.
+
+    The styled path (``get_status_from_styled_screen``, opted in via
+    ``supports_styled_screen_detection``) hands the shared classifier rows
+    with their SGR styling reconstructed from the pyte cell buffer
+    (``cli_agent_orchestrator.utils.pyte_ansi``), which separates rows that
+    are identical in plain text: colour-253 ``●`` final answer, bold-111 tool
+    call, 244-italic thinking bullet, dim-222 ✨ user echo. COMPLETED then
+    requires a positional proof: a visible user echo, a trailing ANSWER-kind
+    row in the region after it, and a fully-drawn composer top border below.
+
+    Fixture provenance: same replay recipe as ``TestCodeTurnIndicatorSlot``
+    (archived raw CAO terminal streams through pyte Screen 400x200), but the
+    non-blank display rows are emitted WITH their reconstructed SGR sequences
+    (one ANSI row per line), then sanitized for publication (task-prompt prose
+    replaced with generic audit text, real paths/symbols/session ids
+    neutralised; terminal structure — styling, bullet glyphs, detail suffixes,
+    box chrome, tip rows, footers, leading whitespace — preserved):
+
+    * ``kimi_code_210_styled_mid_turn_diff_bottom.txt`` — terminal c25a4ee2
+      @byte 66560: the 53.2s slot-empty gap; ``● Read 2 files`` /
+      ``● Using Edit (calculator.py)`` with a torn diff as the trailing turn
+      content above a complete composer. Plain path: COMPLETED (the bug).
+    * ``kimi_code_210_styled_mid_turn_plan_bullet_torn_composer.txt`` —
+      terminal d9b7ac19 @byte 100352: mid-turn plan bullets (K3-256k draws
+      them in the same colour 253 as a final answer, so bullet colour cannot
+      split them) above a TORN composer (``│ >`` / ``╰─╯`` with no ``╭─`` top
+      border). Plain path: COMPLETED (the bug).
+    * ``kimi_code_210_styled_torn_frame_no_footer.txt`` — terminal c25a4ee2
+      @byte 38144: footer-less torn frame (``● Using Read`` in flight, idle
+      tip row, composer, but no ``context:`` footer). Plain path: COMPLETED
+      via the sparkle trap (the bug).
+    * ``kimi_code_210_styled_turn_completed.txt`` — terminal 059bec94 @END:
+      genuine final answer trailing the region, full composer. Both paths:
+      COMPLETED.
+    * ``kimi_code_210_styled_fresh_idle.txt`` — terminal c25a4ee2 @byte 7168:
+      fresh pre-prompt idle (shell launch lines, composer, status bar). Both
+      paths: IDLE.
+    """
+
+    @staticmethod
+    def _styled_rows(fixture_name: str):
+        raw_rows = [
+            ln for ln in _fixture(fixture_name).split("\n") if pyte_ansi.strip_sgr(ln).strip()
+        ]
+        clean_rows = [pyte_ansi.strip_sgr(ln).rstrip() for ln in raw_rows]
+        return raw_rows, clean_rows
+
+    @pytest.mark.parametrize(
+        "fixture_name,expected",
+        [
+            ("kimi_code_210_styled_mid_turn_diff_bottom.txt", TerminalStatus.PROCESSING),
+            (
+                "kimi_code_210_styled_mid_turn_plan_bullet_torn_composer.txt",
+                TerminalStatus.PROCESSING,
+            ),
+            ("kimi_code_210_styled_torn_frame_no_footer.txt", TerminalStatus.PROCESSING),
+            ("kimi_code_210_styled_turn_completed.txt", TerminalStatus.COMPLETED),
+            ("kimi_code_210_styled_fresh_idle.txt", TerminalStatus.IDLE),
+        ],
+    )
+    def test_replayed_210_styled_frames_classify_correctly(self, fixture_name, expected):
+        raw_rows, clean_rows = self._styled_rows(fixture_name)
+        provider = _code_provider(f"styled-{fixture_name}")
+        assert provider.get_status_from_styled_screen(raw_rows, clean_rows) is expected
+
+    @pytest.mark.parametrize(
+        "fixture_name",
+        [
+            "kimi_code_210_styled_mid_turn_diff_bottom.txt",
+            "kimi_code_210_styled_mid_turn_plan_bullet_torn_composer.txt",
+            "kimi_code_210_styled_torn_frame_no_footer.txt",
+        ],
+    )
+    def test_plain_path_alone_would_false_complete(self, fixture_name):
+        """The regression pin: on these frames the plain detector says COMPLETED.
+
+        If a future refactor changes the plain path so it no longer false-
+        completes here, this assertion — not the styled one — is the one to
+        revisit: it documents WHY the styled path exists.
+        """
+        raw_rows, clean_rows = self._styled_rows(fixture_name)
+        provider = _code_provider(f"before-after-{fixture_name}")
+        assert provider.get_status_from_screen(clean_rows) is TerminalStatus.COMPLETED
+        assert (
+            provider.get_status_from_styled_screen(raw_rows, clean_rows)
+            is TerminalStatus.PROCESSING
+        )
+
+    def test_legacy_dialect_delegates_to_the_plain_detector(self):
+        """Legacy styling was never surveyed: LEGACY keeps the historical path."""
+        raw_rows, clean_rows = self._styled_rows("kimi_code_210_styled_turn_completed.txt")
+        provider = KimiCliProvider("term-legacy", "session-1", "window-1")
+        provider._kimi_binary = "/usr/bin/kimi"
+        provider._dialect = KimiDialect.LEGACY
+        assert provider.get_status_from_styled_screen(
+            raw_rows, clean_rows
+        ) is provider.get_status_from_screen(clean_rows)
+
+    def test_kimi_opts_into_styled_screen_detection(self):
+        assert _code_provider("styled-flag").supports_styled_screen_detection is True

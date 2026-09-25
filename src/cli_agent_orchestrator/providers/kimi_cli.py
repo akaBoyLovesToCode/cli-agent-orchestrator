@@ -684,6 +684,64 @@ def _is_live_turn_spinner_line(
 #: Top border of the Kimi Code composer box (``╭─…``), optionally indented.
 _COMPOSER_TOP_RE = re.compile(r"^[^\S\n]*╭")
 
+# Kind sets for the styled-screen discriminator
+# (``get_status_from_styled_screen``). They exist because the plain-text
+# classifier path cannot see what SGR styling proves: Kimi Code 2.1.0 has
+# mid-turn frames where the turn-indicator slot is genuinely EMPTY (the tip row
+# is transiently erased while a tool diff renders), so "slot occupied" alone
+# cannot distinguish "thinking pause" from "turn finished". The discriminator
+# is positional instead: after the last user echo, the turn is COMPLETED only
+# when the trailing non-chrome content before a fully-drawn composer is an
+# answer row (FINAL_BULLET or CONTENT in the shared classifier's vocabulary).
+#
+#: Region rows that carry no turn-progress evidence either way: blank space,
+#: box-drawing rules, the rotating idle tip, and the live spinner (a live
+#: spinner is caught earlier by the dedicated spinner checks; skipping it here
+#: keeps it from becoming the "trailing" row of an answer region).
+_STYLED_REGION_SKIP_KINDS = frozenset(
+    {
+        kt.KimiLineKind.BLANK,
+        kt.KimiLineKind.RULE,
+        kt.KimiLineKind.IDLE_TIP,
+        kt.KimiLineKind.LIVE_SPINNER,
+    }
+)
+#: Kinds that only ever appear while a turn is in flight (tool calls and their
+#: chrome, thinking bullets, and ``●`` bullets the classifier proved are NOT
+#: final answers by their 256-colour styling). One visible instance anywhere on
+#: the composited screen is enough to reject IDLE.
+_STYLED_MID_TURN_KINDS = frozenset(
+    {
+        kt.KimiLineKind.TOOL_CALL,
+        kt.KimiLineKind.TOOL_CHROME,
+        kt.KimiLineKind.THINKING_BULLET,
+        kt.KimiLineKind.FINAL_BULLET,
+    }
+)
+#: Same idea for the footer-less (torn) frame, where the status bar is not
+#: rendered at all. There the classifier falls through to the legacy sparkle
+#: branch, and the user's own ✨-echo satisfies ``IDLE_PROMPT_PATTERN`` — the
+#: false-COMPLETED trap these kinds head off. USER_INPUT counts as mid-turn
+#: here because a torn frame that still shows the echo but no answer cannot be
+#: settled; IDLE_TIP/LIVE_SPINNER are in-flight indicators by definition.
+_STYLED_TORN_MID_TURN_KINDS = frozenset(
+    {
+        kt.KimiLineKind.USER_INPUT,
+        kt.KimiLineKind.TOOL_CALL,
+        kt.KimiLineKind.TOOL_CHROME,
+        kt.KimiLineKind.THINKING_BULLET,
+        kt.KimiLineKind.FINAL_BULLET,
+        kt.KimiLineKind.LIVE_SPINNER,
+        kt.KimiLineKind.IDLE_TIP,
+    }
+)
+#: Composer top border for the styled path: stricter than ``_COMPOSER_TOP_RE``
+#: (which matches any ``╭`` after whitespace) because the discriminator credits
+#: COMPLETED only when the composer is FULLY drawn — a torn frame may show the
+#: transcript without the composer box, and an answer quoted inside the
+#: transcript is not a composer.
+_STYLED_COMPOSER_TOP_RE = re.compile(r"^\s*╭[─━═]{2,}")
+
 
 def _turn_indicator_slot_occupied(rows: List[str]) -> bool:
     """True when Kimi Code's turn-indicator slot is occupied.
@@ -2231,6 +2289,12 @@ class KimiCliProvider(BaseProvider):
     # Opt in to pyte rendered-screen detection (gated by CAO_PYTE_STATUS).
     supports_screen_detection = True
 
+    # Opt in to the styled variant: the monitor hands this provider both the
+    # SGR-bearing rows and their stripped forms, and
+    # ``get_status_from_styled_screen`` runs the positional discriminator that
+    # plain text cannot express (see that method's docstring).
+    supports_styled_screen_detection = True
+
     supports_direct_status_probe = True
     requires_execution_evidence = True
 
@@ -2370,6 +2434,127 @@ class KimiCliProvider(BaseProvider):
         # streaming" is a safe default, but on a fully rendered screen the
         # absence of all TUI chrome means we are NOT looking at an active Kimi
         # turn — so report UNKNOWN rather than a false PROCESSING.
+        return TerminalStatus.UNKNOWN
+
+    def get_status_from_styled_screen(
+        self, raw_lines: List[str], clean_lines: List[str]
+    ) -> TerminalStatus:
+        """Detect status from a pyte viewport with SGR styling preserved.
+
+        ``raw_lines`` carry the reconstructed SGR sequences (see
+        :mod:`cli_agent_orchestrator.utils.pyte_ansi`); ``clean_lines`` are the
+        same rows stripped. The shared classifier uses the styling to tell
+        rows apart that are identical in plain text — a colour-253 ``●`` final
+        answer vs. a bold-111 tool call vs. a 244-italic thinking bullet vs.
+        the user's own dim-222 ✨ echo — and that evidence is what makes the
+        positional discriminator below sound.
+
+        Why plain text is not enough (both observed live):
+
+        * Kimi Code 2.1.0 has mid-turn frames where the turn-indicator slot is
+          genuinely EMPTY — the tip row is transiently erased while an Edit
+          diff renders — with the composer fully visible and no spinner. The
+          plain path's 0.2s quiescence fires inside that gap and reports
+          COMPLETED while the turn is still streaming (smoke terminal
+          c25a4ee2, 66.5s frame: ``● Read 2 files`` / ``● Using Edit`` and a
+          diff as the trailing turn content above a complete composer).
+        * A footer-less torn frame (status bar not yet repainted) falls into
+          ``get_status_from_screen``'s legacy sparkle branch, where the user's
+          own ✨ echo matches ``IDLE_PROMPT_PATTERN`` → false COMPLETED.
+
+        The discriminator is positional, not glyph-based: on the 256k context
+        builds (K3-256k) plan bullets share colour 253 with the final answer,
+        so bullet colour alone cannot split "plan" from "done". A frame is
+        COMPLETED iff all three hold:
+
+        1. a user echo is visible (the region of interest starts after it);
+        2. the trailing non-chrome row of that region (skipping blanks, rules,
+           idle tips and spinner rows) is an ANSWER kind
+           (:data:`kt.ANSWER_KINDS`) — a trailing TOOL_CALL / TOOL_CHROME /
+           THINKING_BULLET means the turn is mid-flight even with the
+           indicator slot empty;
+        3. a fully-drawn composer top border is present below the region, so a
+           torn transcript without chrome cannot pass.
+
+        Anything with a visible echo that fails (2) or (3) is PROCESSING: the
+        turn has demonstrably started and has not demonstrably finished. Under
+        LEGACY semantics the styled evidence does not apply (legacy styling
+        was never surveyed), so the method delegates to the plain path.
+        """
+        if self._spinner_semantics() is not kt.SpinnerSemantics.CODE:
+            return self.get_status_from_screen(clean_lines)
+
+        pairs = [(r, c) for r, c in zip(raw_lines, clean_lines) if c.strip()]
+        if not pairs:
+            return TerminalStatus.UNKNOWN
+        raws = [r for r, _ in pairs]
+        cleans = [c for _, c in pairs]
+        joined = "\n".join(cleans)
+        tail = cleans[-18:]
+
+        # Same boot gate as the plain path: "connecting to mcp servers" is
+        # PROCESSING, never IDLE (a message delivered then is absorbed).
+        if any(kt.MCP_BOOT_ROW_RE.match(ln) for ln in cleans if not kt.is_response_marker_line(ln)):
+            return TerminalStatus.PROCESSING
+
+        semantics = kt.SpinnerSemantics.CODE
+        if re.search(NEW_TUI_STATUS_PATTERN, joined):
+            # A live spinner or an occupied turn-indicator slot is positive
+            # in-flight evidence and still outranks everything else.
+            if any(_is_live_turn_spinner_line(ln, semantics) for ln in tail):
+                return TerminalStatus.PROCESSING
+            if _turn_indicator_slot_occupied(cleans):
+                return TerminalStatus.PROCESSING
+            if re.search(ERROR_PATTERN, joined, re.MULTILINE):
+                return TerminalStatus.ERROR
+            kinds = kt.classify_rows(raws, cleans, semantics)
+            echo = max(
+                (i for i, k in enumerate(kinds) if k is kt.KimiLineKind.USER_INPUT),
+                default=-1,
+            )
+            start = echo + 1 if echo >= 0 else 0
+            # The composer boundary: ``READY_INPUT_FRAME``/composer rows cut
+            # the region even in a torn frame where only part of the box
+            # rendered; ``comp_top`` additionally requires the FULL top border
+            # for the COMPLETED verdict so a composer-less torn frame fails
+            # condition (3).
+            comp_top = next(
+                (i for i in range(start, len(cleans)) if _STYLED_COMPOSER_TOP_RE.match(cleans[i])),
+                None,
+            )
+            comp_any = next(
+                (
+                    i
+                    for i in range(start, len(kinds))
+                    if kinds[i] is kt.KimiLineKind.READY_INPUT_FRAME
+                    or kt.is_composer_row(cleans[i])
+                ),
+                len(kinds),
+            )
+            region = kinds[start:comp_any]
+            trailing = next(
+                (k for k in reversed(region) if k not in _STYLED_REGION_SKIP_KINDS),
+                None,
+            )
+            if echo >= 0 and trailing in kt.ANSWER_KINDS and comp_top is not None:
+                return TerminalStatus.COMPLETED
+            if echo >= 0:
+                # Turn started, not demonstrably finished: mid-turn slot-empty
+                # gap, or trailing tool/thinking content above the composer.
+                return TerminalStatus.PROCESSING
+            if any(k in _STYLED_MID_TURN_KINDS for k in kinds):
+                return TerminalStatus.PROCESSING
+            return TerminalStatus.IDLE
+
+        # Footer-less (torn) frame: the status bar has not been repainted, so
+        # none of the NEW_TUI gates apply — and the plain path's legacy
+        # sparkle branch must NOT run here, because the user's own ✨ echo
+        # satisfies IDLE_PROMPT_PATTERN (the false-COMPLETED trap). Any
+        # in-flight or not-yet-answered evidence means PROCESSING; otherwise
+        # the frame is too incomplete to classify.
+        kinds = kt.classify_rows(raws, cleans, semantics)
+        if any(k in _STYLED_TORN_MID_TURN_KINDS for k in kinds):
+            return TerminalStatus.PROCESSING
         return TerminalStatus.UNKNOWN
 
     def extract_last_message_from_script(self, script_output: str) -> str:

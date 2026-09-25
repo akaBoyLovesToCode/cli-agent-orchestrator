@@ -526,7 +526,7 @@ in flight when a **braille** indicator is present; under Kimi Code semantics a
 moon is not evidence of work, because that dialect rotates moons through its
 *idle* tip row. The legacy bare-moon signal is preserved unchanged.
 
-Two independent paths exist and must agree:
+Three detection entry points exist, sharing one classifier:
 
 - `get_status(output)` — the raw rolling buffer. It strips pipe-pane escapes
   first, so the bottom-anchored checks see line-oriented text.
@@ -543,6 +543,28 @@ Two independent paths exist and must agree:
   plan narration too, so a mid-turn thinking pause can show bullets while
   still streaming). Composer adjacency is what separates the slot from a moon
   row quoted inside an answer, which stays content.
+- `get_status_from_styled_screen(raw_lines, clean_lines)` — the same pyte
+  viewport with SGR styling reconstructed from the cell buffer
+  (`utils/pyte_ansi.py`), opted in via `supports_styled_screen_detection`.
+  For kimi_cli under CODE semantics this **replaces** the plain screen path
+  (LEGACY delegates to it — legacy styling was never surveyed). The slot rule
+  alone is not sufficient in plain text, and both failure modes were observed
+  live: (a) the slot can be transiently **empty** mid-turn (the tip row is
+  erased while an Edit diff renders) with the composer fully drawn, so the
+  monitor's quiescence fires in the gap and bullets read COMPLETED; (b) a
+  footer-less torn frame falls into the legacy sparkle branch, where the
+  user's own ✨ echo matches the idle-prompt pattern. Styling separates rows
+  that are identical in plain text — colour-253 `●` final answer, bold-111
+  tool call, 244-italic thinking bullet, dim-222 ✨ echo — so the styled path
+  uses a **positional** discriminator instead: COMPLETED requires a visible
+  user echo, a trailing ANSWER-kind row (final bullet / answer content) in
+  the region after that echo, and a fully-drawn composer top border below
+  the region. Bullet colour cannot play this role on its own: K3-256k builds
+  draw plan bullets in the same 253 as the final answer. A visible echo
+  without the trailing answer (tool call, tool chrome, or thinking bullet
+  last; composer torn) is PROCESSING; a footer-less torn frame never takes
+  the sparkle branch — any in-flight evidence there is PROCESSING, else
+  UNKNOWN.
 
 A response bullet latches "input received", so a long response that scrolls its
 bullets out of the buffer still reads COMPLETED rather than IDLE. Nothing

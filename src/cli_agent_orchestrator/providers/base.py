@@ -214,6 +214,31 @@ class BaseProvider(ABC):
     # never probed: the terminal keeps the status the edges give it.
     supports_midburst_processing_probe: bool = False
 
+    # Opt-in for the STYLED pyte screen path (StatusMonitor._styled_screen_rows).
+    # Set True ONLY alongside a get_status_from_styled_screen() override
+    # calibrated for rows whose per-cell pyte styling has been re-emitted as
+    # SGR runs (utils.pyte_ansi). Providers left False keep the escape-free
+    # get_status_from_screen() path unchanged — the monitor never routes them
+    # through the styled path, so their detectors see no new input shape.
+    supports_styled_screen_detection: bool = False
+
+    def get_status_from_styled_screen(
+        self, raw_lines: List[str], clean_lines: List[str]
+    ) -> TerminalStatus:
+        """Detect status from a pyte viewport with per-cell styling restored.
+
+        ``raw_lines`` are the viewport rows with the buffer's per-cell styles
+        re-emitted as SGR runs (see
+        :mod:`cli_agent_orchestrator.utils.pyte_ansi`); ``clean_lines`` are
+        the same rows escape-free. Called by the StatusMonitor in place of
+        get_status_from_screen only when ``supports_styled_screen_detection``
+        is True.
+
+        Default: delegate to the plain escape-free detector — a safe no-op
+        fallback mirroring get_status_from_screen's own default.
+        """
+        return self.get_status_from_screen(clean_lines)
+
     def probe_processing_from_screen(self, screen_lines: List[str]) -> bool:
         """Report whether this half-drawn frame shows the agent actively working.
 

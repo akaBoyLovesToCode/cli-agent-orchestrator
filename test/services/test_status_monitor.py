@@ -9,14 +9,20 @@ provider's native status. These tests pin both paths.
 import logging
 import threading
 import time
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import pyte
+
 from cli_agent_orchestrator.models.terminal import TerminalStatus
+from cli_agent_orchestrator.providers import kimi_transcript as kt
+from cli_agent_orchestrator.providers.kimi_cli import KimiCliProvider, KimiDialect
 from cli_agent_orchestrator.services.status_monitor import (
     STALE_PROCESSING_BUFFER_QUIET_S,
     STALE_PROCESSING_CONFIRM_TTL_S,
     StatusMonitor,
 )
+from cli_agent_orchestrator.utils import pyte_ansi
 
 
 def _backend(event_inbox):
@@ -1430,6 +1436,10 @@ class TestPyteFeedFailure:
     def _screen_provider(status=TerminalStatus.PROCESSING):
         provider = MagicMock()
         provider.supports_screen_detection = True
+        # Bare MagicMock auto-attrs are truthy, which would route this double
+        # through the styled-screen branch in _detect_screen; these tests pin
+        # the plain get_status_from_screen routing.
+        provider.supports_styled_screen_detection = False
         provider.get_status_from_screen.return_value = status
         return provider
 
@@ -1523,3 +1533,113 @@ class TestPyteFeedFailure:
         sm._feed_failures["t1"] = (3, 123.0)
         sm.reset_buffer("t1")
         assert "t1" not in sm._feed_failures
+
+
+class TestStyledScreenReconstruction:
+    """pyte cell buffer → SGR rows: the styled evidence survives the round trip.
+
+    ``get_status_from_styled_screen`` trusts the shared classifier's kind
+    assignment, which keys on SGR styling that plain text loses. The rows
+    here are modelled byte-for-byte on the real Kimi Code 2.1.0 shapes (see
+    the ``kimi_code_210_styled_*`` fixtures): 222+bold ✨ user echo, 244
+    bullet with 244-italic payload for thinking, 114 bullet with bold-111
+    tool name for a tool call, 253 bullet for the final answer.
+    """
+
+    @staticmethod
+    def _render(*rows: str):
+        screen = pyte.Screen(400, 200)
+        stream = pyte.Stream(screen)
+        stream.feed("\r\n".join(rows))
+        raw_rows = pyte_ansi.screen_to_ansi_rows(screen)
+        pairs = [(r, pyte_ansi.strip_sgr(r).rstrip()) for r in raw_rows]
+        pairs = [(r, c) for r, c in pairs if c.strip()]
+        return [r for r, _ in pairs], [c for _, c in pairs]
+
+    def test_styled_kinds_survive_reconstruction(self):
+        raw_rows, clean_rows = self._render(
+            " \x1b[38;5;222m\x1b[1m✨ audit the seed codes\x1b[0m",
+            " \x1b[38;5;244m● \x1b[0m\x1b[38;5;244m\x1b[3mChecking the seed codes first.\x1b[0m",
+            " \x1b[38;5;114m● \x1b[0mUsed \x1b[38;5;111m\x1b[1mRead\x1b[0m (pkg/models/orders.py) · 12 lines",
+            " \x1b[38;5;253m● \x1b[0mAll seed codes verified.",
+        )
+        kinds = kt.classify_rows(raw_rows, clean_rows, kt.SpinnerSemantics.CODE)
+        assert kinds == [
+            kt.KimiLineKind.USER_INPUT,
+            kt.KimiLineKind.THINKING_BULLET,
+            kt.KimiLineKind.TOOL_CALL,
+            kt.KimiLineKind.FINAL_BULLET,
+        ]
+
+    def test_reconstruction_preserves_the_styling_evidence(self):
+        raw_rows, clean_rows = self._render(
+            " \x1b[38;5;222m\x1b[1m✨ audit the seed codes\x1b[0m",
+            " \x1b[38;5;244m● \x1b[0m\x1b[38;5;244m\x1b[3mChecking the seed codes first.\x1b[0m",
+            " \x1b[38;5;114m● \x1b[0mUsed \x1b[38;5;111m\x1b[1mRead\x1b[0m (pkg/models/orders.py) · 12 lines",
+            " \x1b[38;5;253m● \x1b[0mAll seed codes verified.",
+        )
+        assert "\x1b[38;5;222m" in raw_rows[0] and "\x1b[1m" in raw_rows[0]
+        assert "\x1b[38;5;244m" in raw_rows[1] and "\x1b[3m" in raw_rows[1]
+        assert "\x1b[38;5;111m" in raw_rows[2]
+        assert "\x1b[38;5;253m" in raw_rows[3]
+        assert clean_rows == [
+            " ✨ audit the seed codes",
+            " ● Checking the seed codes first.",
+            " ● Used Read (pkg/models/orders.py) · 12 lines",
+            " ● All seed codes verified.",
+        ]
+
+    def test_default_styled_text_gets_no_leading_reset(self):
+        """A leading ``\\x1b[0m`` would break the classifier's ``^\\s*`` anchors."""
+        raw_rows, _ = self._render("plain shell prompt$")
+        assert raw_rows[0].startswith("plain")
+        assert pyte_ansi.strip_sgr("\x1b[38;5;253m●\x1b[0m") == "●"
+
+
+class TestStyledScreenMonitorIntegration:
+    """Raw bytes → pyte feed → styled detector → latched status (kimi CODE).
+
+    Pins the monitor wiring end to end: with a real KimiCliProvider in the
+    CODE dialect the screen path must route through
+    ``get_status_from_styled_screen`` (opted in via
+    ``supports_styled_screen_detection``), so the c25a4ee2 slot-empty-gap
+    frame latches PROCESSING — never COMPLETED — while the genuine 059bec94
+    final frame still completes. Both fixtures are fed as raw bytes through
+    the monitor's own pyte pipeline, not handed to the detector as text.
+    """
+
+    FIXTURES = Path(__file__).resolve().parents[1] / "providers" / "fixtures"
+
+    @staticmethod
+    def _provider():
+        provider = KimiCliProvider("t1", "session-1", "window-1")
+        provider._kimi_binary = "/usr/bin/kimi"
+        provider._dialect = KimiDialect.CODE
+        return provider
+
+    def _feed(self, sm, fixture_name):
+        text = (self.FIXTURES / fixture_name).read_text(encoding="utf-8")
+        sm._process_chunk("t1", "\r\n".join(ln for ln in text.split("\n") if ln) + "\r\n")
+
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    def test_slot_empty_gap_frame_never_latches_completed(self, mock_pm):
+        mock_pm.get_provider.return_value = self._provider()
+        sm = StatusMonitor()
+
+        self._feed(sm, "kimi_code_210_styled_mid_turn_diff_bottom.txt")
+
+        assert sm._last_status["t1"] is TerminalStatus.PROCESSING
+
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    def test_processing_then_completed_across_frames(self, mock_pm):
+        mock_pm.get_provider.return_value = self._provider()
+        sm = StatusMonitor()
+
+        self._feed(sm, "kimi_code_210_styled_mid_turn_diff_bottom.txt")
+        assert sm._last_status["t1"] is TerminalStatus.PROCESSING
+
+        # The completed fixture carries its own user echo, which becomes the
+        # last echo on the composited screen — the region after it trails with
+        # the final answer above a full composer, so the turn completes.
+        self._feed(sm, "kimi_code_210_styled_turn_completed.txt")
+        assert sm._last_status["t1"] is TerminalStatus.COMPLETED

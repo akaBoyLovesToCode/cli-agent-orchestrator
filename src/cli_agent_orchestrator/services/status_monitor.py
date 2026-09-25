@@ -436,10 +436,67 @@ class StatusMonitor:
                 )
                 return None, buffer
 
+    def _styled_screen_rows(
+        self, terminal_id: str
+    ) -> Tuple[Optional[List[str]], Optional[List[str]], str]:
+        """Render the composited screen with SGR styling reconstructed.
+
+        Returns ``(styled_rows, clean_rows, buffer)``: the SGR-bearing rows
+        (via :func:`cli_agent_orchestrator.utils.pyte_ansi.screen_to_ansi_rows`)
+        and the same rows stripped, so a provider's styled detector gets both
+        forms of one consistent snapshot. ``styled_rows`` is None when the
+        render itself failed — mirroring ``_screen_lines``, so the caller can
+        take the raw-buffer fallback only for a real failure.
+        """
+        with self._lock:
+            scr = self._screens.get(terminal_id)
+            buffer = self._buffers.get(terminal_id, "")
+            try:
+                if scr is None:
+                    return [], [], buffer
+                from cli_agent_orchestrator.utils import pyte_ansi
+
+                raw_rows = pyte_ansi.screen_to_ansi_rows(scr[0])
+                clean_rows = [pyte_ansi.strip_sgr(row).rstrip() for row in raw_rows]
+                return raw_rows, clean_rows, buffer
+            except Exception:
+                # Same transient-render hazard as _screen_lines; the raw
+                # buffer fallback keeps status monitoring alive.
+                logger.exception(
+                    "Error rendering styled screen status for %s; falling back to raw buffer",
+                    terminal_id,
+                )
+                return None, None, buffer
+
     def _detect_screen(
         self, terminal_id: str, provider: Optional["BaseProvider"]
     ) -> TerminalStatus:
         """Detect status from the terminal's composited pyte screen."""
+        # Styled path (opt-in): providers that need SGR evidence to classify a
+        # frame — Kimi Code's final-answer vs. tool-call bullets are identical
+        # in plain text — get both row forms and run their styled detector
+        # instead of the plain one.
+        styled = (
+            provider is not None
+            and getattr(provider, "supports_styled_screen_detection", False)
+            and callable(getattr(provider, "get_status_from_styled_screen", None))
+        )
+        if styled:
+            raw_rows, clean_rows, buffer = self._styled_screen_rows(terminal_id)
+            if raw_rows is None:
+                try:
+                    return provider.get_status(buffer)
+                except Exception:
+                    logger.exception("Error detecting fallback status for %s", terminal_id)
+                    return TerminalStatus.UNKNOWN
+            if not clean_rows:
+                return TerminalStatus.UNKNOWN
+            try:
+                return provider.get_status_from_styled_screen(raw_rows, clean_rows)
+            except Exception:
+                # Full traceback, same rationale as the plain path below.
+                logger.exception(f"Error detecting styled screen status for {terminal_id}")
+                return TerminalStatus.UNKNOWN
         rendered, buffer = self._screen_lines(terminal_id)
         fallback_buffer: Optional[str] = None if rendered is not None else buffer
         lines: List[str] = rendered or []
