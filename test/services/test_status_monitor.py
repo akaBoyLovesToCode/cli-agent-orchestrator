@@ -631,6 +631,9 @@ class TestStaleProcessingCapturePane:
         provider.session_name = "s1"
         provider.window_name = "w1"
         provider.supports_screen_detection = True
+        # Bare MagicMock auto-attrs are truthy, which would route this double
+        # through the styled-capture tier; this test pins the PLAIN tier.
+        provider.supports_styled_screen_detection = False
         provider.get_status_from_screen.return_value = TerminalStatus.IDLE
         mock_pm.get_provider.return_value = provider
         backend = _backend(event_inbox=False)
@@ -1643,3 +1646,145 @@ class TestStyledScreenMonitorIntegration:
         # the final answer above a full composer, so the turn completes.
         self._feed(sm, "kimi_code_210_styled_turn_completed.txt")
         assert sm._last_status["t1"] is TerminalStatus.COMPLETED
+
+
+class TestStaleProcessingRecheckRouting:
+    """The cached-PROCESSING poll re-check must not run the raw-stream detector
+    on a screen-capable provider.
+
+    Pre-fix, ``get_status()``'s cheap re-check called ``_detect_status`` (the
+    provider's raw ``get_status``) on every poll while cached==PROCESSING. On
+    kimi that detector needs no answer evidence past its 5s dispatch grace, so
+    a settled-but-unanswered frame — the 6e0c7d4c/791c93eb auth refusal —
+    read COMPLETED and killed the worker. Screen-capable providers now
+    re-check through ``_detect_screen`` (the a5d3196f styled discriminator
+    for kimi); providers without the opt-in keep the raw re-check.
+    """
+
+    @staticmethod
+    def _monitor():
+        sm = StatusMonitor()
+        sm._last_status["t1"] = TerminalStatus.PROCESSING
+        sm._buffers["t1"] = "partial output"
+        return sm
+
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    def test_screen_provider_recheck_uses_detect_screen(self, mock_pm, mock_get_backend):
+        mock_get_backend.return_value = _backend(event_inbox=False)
+        provider = MagicMock()
+        provider.supports_screen_detection = True
+        mock_pm.get_provider.return_value = provider
+        sm = self._monitor()
+        sm._detect_screen = MagicMock(return_value=TerminalStatus.PROCESSING)
+        sm._detect_status = MagicMock(side_effect=AssertionError("raw re-check must not run"))
+
+        assert sm.get_status("t1") is TerminalStatus.PROCESSING
+        sm._detect_screen.assert_called_once_with("t1", provider)
+        sm._detect_status.assert_not_called()
+
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    def test_screen_recheck_verdict_is_applied(self, mock_pm, mock_get_backend):
+        mock_get_backend.return_value = _backend(event_inbox=False)
+        provider = MagicMock()
+        provider.supports_screen_detection = True
+        mock_pm.get_provider.return_value = provider
+        sm = self._monitor()
+        sm._detect_screen = MagicMock(return_value=TerminalStatus.ERROR)
+
+        assert sm.get_status("t1") is TerminalStatus.ERROR
+        assert sm._last_status["t1"] is TerminalStatus.ERROR
+
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    def test_non_screen_provider_keeps_raw_recheck(self, mock_pm, mock_get_backend):
+        mock_get_backend.return_value = _backend(event_inbox=False)
+        provider = MagicMock()
+        provider.supports_screen_detection = False
+        mock_pm.get_provider.return_value = provider
+        sm = self._monitor()
+        sm._detect_status = MagicMock(return_value=TerminalStatus.PROCESSING)
+        sm._detect_screen = MagicMock(side_effect=AssertionError("screen path must not run"))
+
+        assert sm.get_status("t1") is TerminalStatus.PROCESSING
+        sm._detect_status.assert_called_once_with("t1", "partial output")
+
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    def test_pyte_status_disabled_keeps_raw_recheck(self, mock_pm, mock_get_backend):
+        mock_get_backend.return_value = _backend(event_inbox=False)
+        provider = MagicMock()
+        provider.supports_screen_detection = True
+        mock_pm.get_provider.return_value = provider
+        sm = self._monitor()
+        sm._detect_status = MagicMock(return_value=TerminalStatus.PROCESSING)
+        sm._detect_screen = MagicMock(side_effect=AssertionError("screen path must not run"))
+
+        with patch("cli_agent_orchestrator.services.status_monitor.CAO_PYTE_STATUS", False):
+            assert sm.get_status("t1") is TerminalStatus.PROCESSING
+        sm._detect_status.assert_called_once_with("t1", "partial output")
+
+
+class TestFreshCapturePaneStyledRouting:
+    """The #558 stale-PROCESSING capture self-heal routes styled providers
+    through the styled detector on an escape-PRESERVING capture.
+
+    Pre-fix, a ``supports_screen_detection`` provider got the plain
+    ``get_status_from_screen`` on a ``strip_escapes=True`` capture — the plain
+    detector's bullet heuristic false-completes mid-turn frames (the
+    4D-era diff-bottom frame classifies COMPLETED on the plain path). Styled
+    providers now capture with ``strip_escapes=False`` (tmux -e keeps the SGR
+    runs; a capture-pane snapshot has no cursor-movement sequences, so
+    per-line styling is intact) and re-detect via
+    ``get_status_from_styled_screen``.
+    """
+
+    @staticmethod
+    def _provider(styled):
+        provider = MagicMock()
+        provider.session_name = "s1"
+        provider.window_name = "w1"
+        provider.supports_screen_detection = True
+        provider.supports_styled_screen_detection = styled
+        return provider
+
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    def test_styled_provider_gets_sgr_capture_and_styled_detector(self, mock_pm, mock_get_backend):
+        provider = self._provider(styled=True)
+        provider.get_status_from_styled_screen.return_value = TerminalStatus.PROCESSING
+        mock_pm.get_provider.return_value = provider
+        backend = _backend(event_inbox=False)
+        backend.get_history.return_value = " \x1b[38;5;253m●\x1b[0m answer text"
+        mock_get_backend.return_value = backend
+        sm = StatusMonitor()
+
+        assert sm._fresh_capture_pane_status("t1", 0) is TerminalStatus.PROCESSING
+        backend.get_history.assert_called_once_with(
+            "s1", "w1", strip_escapes=False, visible_only=True
+        )
+        provider.get_status_from_styled_screen.assert_called_once()
+        raw_lines, clean_lines = provider.get_status_from_styled_screen.call_args[0]
+        assert raw_lines == [" \x1b[38;5;253m●\x1b[0m answer text"]
+        assert clean_lines == [" ● answer text"]
+        provider.get_status_from_screen.assert_not_called()
+        provider.get_status.assert_not_called()
+
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    def test_plain_screen_provider_keeps_stripped_capture(self, mock_pm, mock_get_backend):
+        provider = self._provider(styled=False)
+        provider.get_status_from_screen.return_value = TerminalStatus.PROCESSING
+        mock_pm.get_provider.return_value = provider
+        backend = _backend(event_inbox=False)
+        backend.get_history.return_value = "plain capture"
+        mock_get_backend.return_value = backend
+        sm = StatusMonitor()
+
+        assert sm._fresh_capture_pane_status("t1", 0) is TerminalStatus.PROCESSING
+        backend.get_history.assert_called_once_with(
+            "s1", "w1", strip_escapes=True, visible_only=True
+        )
+        provider.get_status_from_screen.assert_called_once_with(["plain capture"])
+        provider.get_status_from_styled_screen.assert_not_called()

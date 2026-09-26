@@ -904,7 +904,32 @@ class StatusMonitor:
                 buffer = ""
 
         if cached == TerminalStatus.PROCESSING and buffer:
-            fresh = self._detect_status(terminal_id, buffer)
+            # Screen-capable providers re-check against the RENDERED screen,
+            # not the raw stream: a raw-stream detector can read a
+            # settled-but-unanswered frame as COMPLETED without any answer
+            # evidence — kimi's raw get_status latches input receipt at
+            # dispatch and its 5.0s dispatch grace is the only thing that
+            # delays the ready verdict, so the post-submission auth refusal
+            # (ready chrome, refusal text the anchored ERROR_PATTERN misses)
+            # false-completed two production workers (6e0c7d4c / 791c93eb)
+            # ~5.5s after send. The screen path for kimi is the styled
+            # discriminator, which requires a trailing answer before COMPLETED.
+            # Providers without the screen opt-in (kiro_cli etc.) keep the raw
+            # re-check; _detect_screen itself degrades to the raw buffer when
+            # the render fails.
+            provider: Optional["BaseProvider"]
+            try:
+                provider = provider_manager.get_provider(terminal_id)
+            except Exception:
+                provider = None
+            if (
+                CAO_PYTE_STATUS
+                and provider is not None
+                and getattr(provider, "supports_screen_detection", False)
+            ):
+                fresh = self._detect_screen(terminal_id, provider)
+            else:
+                fresh = self._detect_status(terminal_id, buffer)
             logger.debug(
                 f"get_status [{terminal_id}]: cached=PROCESSING, "
                 f"fresh={fresh.value}, buffer_len={len(buffer)}"
@@ -1026,6 +1051,14 @@ class StatusMonitor:
         safe on rendered snapshots — the same contract terminal_service's deferred-init
         direct probe relies on), and providers with neither flag fail CLOSED: no capture,
         no verdict, the terminal stays PROCESSING until the pipeline resolves it.
+        Within the screen tier, ``supports_styled_screen_detection`` providers (kimi)
+        go one step further: the capture keeps its SGR runs
+        (``strip_escapes=False`` — a capture-pane snapshot has no cursor-movement
+        sequences, so per-line styling arrives intact) and detection runs through
+        ``get_status_from_styled_screen()``. The plain detector's bullet heuristic
+        false-completes mid-turn frames on this path too (the 4D-era diff-bottom
+        frame classifies COMPLETED on it), so the styled discriminator — which
+        requires a trailing answer — is the only trusted verdict source for kimi.
         The read is viewport-only (``visible_only=True`` — capture-pane ``-S 0``): a
         ``tail_lines`` read would include scrollback ABOVE the viewport, and detectors
         that match anywhere in their input (kimi/kiro ERROR indicators) would resurrect
@@ -1075,6 +1108,8 @@ class StatusMonitor:
             # them.
             return None
 
+        use_styled = use_screen and getattr(provider, "supports_styled_screen_detection", False)
+
         try:
             from cli_agent_orchestrator.backends.registry import get_backend
 
@@ -1083,10 +1118,12 @@ class StatusMonitor:
             # includes scrollback, and detectors that match anywhere in their input
             # (kiro/kimi ERROR indicators) would resurrect text from finished turns.
             # Only the currently rendered screen is evidence about the current turn.
+            # Styled providers need the SGR runs (strip_escapes=False); everyone
+            # else gets the escape-free text their detectors were calibrated on.
             fresh_output = get_backend().get_history(
                 provider.session_name,
                 provider.window_name,
-                strip_escapes=True,
+                strip_escapes=not use_styled,
                 visible_only=True,
             )
         except Exception as e:
@@ -1098,7 +1135,13 @@ class StatusMonitor:
             return None
 
         try:
-            if use_screen:
+            if use_styled:
+                from cli_agent_orchestrator.utils import pyte_ansi
+
+                raw_lines = fresh_output.splitlines()
+                clean_lines = [pyte_ansi.strip_sgr(ln).rstrip() for ln in raw_lines]
+                detected = provider.get_status_from_styled_screen(raw_lines, clean_lines)
+            elif use_screen:
                 detected = provider.get_status_from_screen(fresh_output.splitlines())
             else:
                 detected = provider.get_status(fresh_output)

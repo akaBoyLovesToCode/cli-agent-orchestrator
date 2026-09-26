@@ -566,6 +566,27 @@ Three detection entry points exist, sharing one classifier:
   the sparkle branch — any in-flight evidence there is PROCESSING, else
   UNKNOWN.
 
+The monitor routes every completion decision for a screen-capable provider
+through the rendered-screen path: the edge-scheduled pyte detection, the
+cached-PROCESSING poll re-check in `StatusMonitor.get_status()` (which
+previously ran the raw-stream `get_status()` — its latched input receipt plus
+a 5s dispatch grace let a settled-but-unanswered frame read COMPLETED without
+any answer evidence), and the #558 stale-PROCESSING capture self-heal (which
+keeps the SGR runs for styled providers: `capture-pane -e`, then
+`get_status_from_styled_screen`).
+
+One frame class is answered by text, not position: a **post-submission auth
+refusal**. Kimi Code 2.1.0 rejects a stored token mid-session with
+`Error: [internal] Stored token for "kimi-code" was rejected; re-login
+required.` (colour 210, indented — the anchored generic error pattern misses
+it) and returns the composer to ready without ever streaming. Both the styled
+path (first, before the boot gate) and the raw path's new-TUI branch (before
+the spinner logic) match `_AUTH_FAILURE_RE` and report ERROR so the step
+fails fast instead of false-completing or timing out. The boot-time
+`Skipped refreshing managed:kimi-code … requires login` notice (colour 215)
+is a different sentence and deliberately does not match — init still reaches
+IDLE on a logged-out terminal.
+
 A response bullet latches "input received", so a long response that scrolls its
 bullets out of the buffer still reads COMPLETED rather than IDLE. Nothing
 latches at init, so a freshly-launched terminal reads IDLE. A bullet only

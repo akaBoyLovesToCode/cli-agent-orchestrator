@@ -783,6 +783,20 @@ ERROR_PATTERN = (
     r"^(?:Error:|ERROR:|Traceback \(most recent call last\):|ConnectionError:|APIError:)"
 )
 
+# Post-submission auth refusal (Kimi Code 2.1.0): when the stored OAuth token
+# is rejected mid-session, the CLI prints ``Error: [internal] Stored token for
+# "<provider>" was rejected; re-login required.`` (colour 210, INDENTED — so
+# the anchored ``ERROR_PATTERN`` above misses it) plus ``/export-debug-zip``
+# advice (colour 244), and returns the composer to ready. The turn is REFUSED:
+# nothing streams, no answer ever trails the echo, and every readiness signal
+# misfires (production terminals 6e0c7d4c / 791c93eb false-completed on it).
+# Matching the refusal text and reporting ERROR lets agent_step fail fast
+# instead of waiting out a timeout. Deliberately NOT matched: the boot-time
+# ``Skipped refreshing managed:kimi-code … requires login`` notice (colour
+# 215) — a different sentence, and init must still reach IDLE. The second
+# alternative spans the TUI's hard line wrap (``re-login\s+required``).
+_AUTH_FAILURE_RE = re.compile(r"Stored token for .{0,60}?was rejected|re-login\s+required")
+
 
 class KimiCliProvider(BaseProvider):
     """Provider for Kimi CLI tool integration.
@@ -2137,6 +2151,12 @@ class KimiCliProvider(BaseProvider):
         # tokens") that is cleared on completion. Gate on the new-TUI markers so
         # legacy (emoji-prompt) builds keep the path below unchanged.
         if re.search(NEW_TUI_STATUS_PATTERN, clean_output):
+            # A refused turn (stored token rejected) renders the ready chrome
+            # with the refusal above it — without this check the dispatch-grace
+            # expiry below reads it COMPLETED (6e0c7d4c / 791c93eb). Checked
+            # before every readiness signal; see _AUTH_FAILURE_RE.
+            if _AUTH_FAILURE_RE.search(clean_output):
+                return TerminalStatus.ERROR
             # A response bullet appears only once a turn produces output
             # (thinking or response); the welcome banner / update nag have none.
             # Latch it so a long response that scrolls the bullets out of the
@@ -2491,6 +2511,15 @@ class KimiCliProvider(BaseProvider):
         cleans = [c for _, c in pairs]
         joined = "\n".join(cleans)
         tail = cleans[-18:]
+
+        # A refused turn (stored token rejected) never produces answer
+        # evidence, so the discriminator below would park at PROCESSING until
+        # the timeout — and any raw re-check would read its settled chrome as
+        # COMPLETED (6e0c7d4c / 791c93eb). Fail fast as ERROR; checked before
+        # the boot gate so a refusal during boot chrome is still caught. See
+        # _AUTH_FAILURE_RE for the deliberately-excluded boot notice.
+        if _AUTH_FAILURE_RE.search(joined):
+            return TerminalStatus.ERROR
 
         # Same boot gate as the plain path: "connecting to mcp servers" is
         # PROCESSING, never IDLE (a message delivered then is absorbed).

@@ -33,7 +33,7 @@ import stat
 import subprocess
 from pathlib import Path
 from typing import Any, Dict
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -4493,3 +4493,98 @@ class TestCodeStyledScreenDiscriminator:
 
     def test_kimi_opts_into_styled_screen_detection(self):
         assert _code_provider("styled-flag").supports_styled_screen_detection is True
+
+
+# =============================================================================
+# A4.5 — post-submission auth refusal (stored token rejected) must read ERROR
+# =============================================================================
+
+
+class TestCodeAuthFailureDetection:
+    """Kimi Code 2.1.0 auth refusal after submission — the 6e0c7d4c incident.
+
+    Both production terminals (6e0c7d4c / 791c93eb, server on a5d3196f) show
+    the same frame immediately after the prompt echo: ``Error: [internal]
+    Stored token for "kimi-code" was rejected; re-login required.`` (colour
+    210) plus the ``/export-debug-zip`` advice (colour 244). The turn is
+    REFUSED — Kimi never streams, the composer returns to ready — so every
+    readiness signal misfires:
+
+    * the styled discriminator parked at PROCESSING (the auth rows classify
+      as echo continuation, so the region after the last echo is empty and no
+      answer ever trails it), and
+    * the legacy RAW detector — run by the StatusMonitor stale-PROCESSING
+      poll re-check — reported COMPLETED once the 5s dispatch grace expired
+      (its ``^Error:`` pattern misses the 3-space-indented refusal), which
+      killed both workers as false completions.
+
+    The fix checks the refusal text FIRST (styled path: before the boot gate;
+    raw path: before the spinner logic) and reports ERROR, which agent_step
+    turns into a fast StepExecutionError instead of a false completion or a
+    900s timeout. The boot-time ``Skipped refreshing managed:kimi-code …
+    requires login`` notice (colour 215) is a different sentence and must NOT
+    trip it — init still reaches IDLE.
+
+    Fixture provenance: ``kimi_code_210_auth_rejected_<tid>.txt`` are the
+    final-frame styled rows of the failed terminals (same pyte 400x200 replay
+    recipe as ``TestCodeStyledScreenDiscriminator``), sanitized (zeroed
+    session ids, generic echo prose, neutral paths); the 210/244 auth rows,
+    the 215 boot notice, composer and footer are verbatim. The ``*_raw.txt``
+    variants are the post-OSC-133;A byte windows (the exact input shape the
+    poll re-check misparsed), echo text runs replaced in place inside their
+    SGR runs, window title and status-bar path sanitized. On the pre-fix code
+    the styled detector returns PROCESSING for both styled fixtures and the
+    raw detector returns COMPLETED for both raw windows (production: COMPLETED
+    at +3328B / +2304B past the 133;A mark, ~5.5s after send).
+    """
+
+    @staticmethod
+    def _styled_rows(fixture_name: str):
+        raw_rows = [
+            ln for ln in _fixture(fixture_name).split("\n") if pyte_ansi.strip_sgr(ln).strip()
+        ]
+        clean_rows = [pyte_ansi.strip_sgr(ln).rstrip() for ln in raw_rows]
+        return raw_rows, clean_rows
+
+    @pytest.mark.parametrize("tid", ["6e0c7d4c", "791c93eb"])
+    def test_styled_detector_flags_auth_refusal_as_error(self, tid):
+        raw_rows, clean_rows = self._styled_rows(f"kimi_code_210_auth_rejected_{tid}.txt")
+        provider = _code_provider(f"auth-styled-{tid}")
+        assert provider.get_status_from_styled_screen(raw_rows, clean_rows) is TerminalStatus.ERROR
+
+    @pytest.mark.parametrize("tid", ["6e0c7d4c", "791c93eb"])
+    def test_raw_detector_flags_auth_refusal_as_error(self, tid):
+        """The stateful poll re-check replay: input latched, grace expired."""
+        import time as _time
+
+        window = _fixture(f"kimi_code_210_auth_rejected_{tid}_raw.txt")
+        provider = _code_provider(f"auth-raw-{tid}")
+        provider.mark_input_received()
+        provider._last_dispatch_time = _time.time() - 6.0  # past the 5.0s grace
+        with patch("cli_agent_orchestrator.providers.kimi_cli.get_backend") as mock_backend:
+            mock_backend.return_value.get_history.side_effect = RuntimeError("pane gone")
+            assert provider.get_status(window) is TerminalStatus.ERROR
+
+    def test_boot_time_refresh_skip_is_not_an_auth_failure(self):
+        """The 215 'Skipped refreshing … requires login' boot notice ≠ refusal."""
+        raw_rows, clean_rows = self._styled_rows("kimi_code_210_styled_fresh_idle.txt")
+        # Inject the real boot notice rows (verbatim from 6e0c7d4c) ahead of
+        # the composer, where they appear on a fresh boot.
+        notice = [
+            "   \x1b[38;5;215mSkipped refreshing managed:kimi-code: OAuth provider "
+            '"managed:kimi-code"\x1b[0m',
+            " \x1b[38;5;215mrequires login before it can be used.\x1b[0m",
+        ]
+        raw_rows = raw_rows[:4] + notice + raw_rows[4:]
+        clean_rows = [pyte_ansi.strip_sgr(ln).rstrip() for ln in raw_rows]
+        provider = _code_provider("auth-boot-notice")
+        assert provider.get_status_from_styled_screen(raw_rows, clean_rows) is TerminalStatus.IDLE
+
+    def test_raw_boot_refresh_skip_is_not_an_auth_failure(self):
+        provider = _code_provider("auth-boot-notice-raw")
+        out = (
+            '   Skipped refreshing managed:kimi-code: OAuth provider "managed:kimi-code"\n'
+            "   requires login before it can be used.\n"
+            "context: 0% (0/1M)\n"
+        )
+        assert provider.get_status(out) is TerminalStatus.IDLE
