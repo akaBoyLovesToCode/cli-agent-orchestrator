@@ -865,16 +865,18 @@ class KimiCliProvider(BaseProvider):
         self._turn_activity_seen = False
         self.execution_evidence_ambiguous = False
         self._status_buffer_epoch = 0
-        # Styled-path turn latch: set when a user echo (✨, colour 222) is
-        # visible on ANY get_status_from_styled_screen() frame of the current
-        # turn. A long turn's output can push the echo off the 200-row pyte
-        # viewport before the final answer finishes (measured live: terminal
-        # ff2e214a streamed 1.8 MB, the echo scrolled off, the genuine final
-        # frame had no USER_INPUT row and the turn timed out at 900s). The
-        # echo is positive turn-start evidence seen at the rising edge ~1s
-        # into the turn, long before it can scroll away — latching it lets
-        # the positional discriminator (trailing answer + complete composer)
-        # still recognize the completion on scrolled frames. Reset by
+        # Styled-path turn latch: positive turn-start evidence for the
+        # current turn, consumed by get_status_from_styled_screen when the
+        # user echo has scrolled off the 200-row pyte viewport. A long turn's
+        # output can push the echo off-screen before the final answer
+        # finishes (measured live: terminals ff2e214a / 9f00a450 streamed
+        # 1.1-1.8 MB and timed out at 900s because the only sampled frames
+        # either preceded the echo or followed its scroll-off). Armed from
+        # the stream itself — observe_execution_output latches the ASCII
+        # OSC 133;A submission marker (split-glyph-immune) or the sparkle
+        # echo within ~1s of dispatch, and any frame with a visible echo
+        # arms it too — long before the echo can scroll away, and never
+        # before this turn's submission exists. Reset by
         # mark_input_received() at each new dispatch.
         self._styled_turn_echo_seen = False
         # Wallclock of the last send_input() dispatch (terminal_service calls
@@ -2377,6 +2379,22 @@ class KimiCliProvider(BaseProvider):
         could own a quoted spinner. If we lose context before seeing activity,
         leave acceptance unconfirmed and disallow an unsafe full resend.
         """
+        # Turn-start evidence, independent of frame sampling: the rolling
+        # buffer (cleared by send_input at each dispatch) carries the OSC
+        # 133;A submission marker / sparkle echo within ~1s of the paste,
+        # long before a long turn's output can push the echo off the 200-row
+        # pyte viewport (terminal 9f00a450: 1.1 MB streamed, every detection
+        # either preceded the echo or followed its scroll-off, so the
+        # frame-based latch never armed and the genuine completion timed
+        # out). The 133;A marker is pure ASCII — immune to the FIFO reader's
+        # per-batch errors="replace" split-glyph corruption. Gated on
+        # _awaiting_turn so a previous turn's markers (pre-clear bytes)
+        # cannot arm a fresh turn; the window before this turn's own marker
+        # arrives (paste echo not yet submitted) keeps the latch disarmed,
+        # which is what prevents a stale previous-turn answer above the
+        # composer from reading COMPLETED on the rising-edge frame.
+        if self._awaiting_turn and ("\x1b]133;A" in output or "✨" in output):
+            self._styled_turn_echo_seen = True
         if epoch != self._status_buffer_epoch or not self._awaiting_turn:
             return
         self.has_execution_evidence(output)

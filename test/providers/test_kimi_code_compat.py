@@ -4665,3 +4665,38 @@ class TestCodeEchoScrolledCompletion:
         assert provider.get_status_from_styled_screen(raw_rows, clean_rows) is (
             TerminalStatus.PROCESSING
         )
+
+    def test_stream_submission_marker_arms_the_latch(self):
+        """The OSC 133;A marker in the observed buffer arms the turn latch.
+
+        Frame sampling cannot be relied on to see the echo (a continuously
+        bursting TUI gets exactly one rising-edge sample before the echo
+        renders and the next sample only after a long turn has pushed the
+        echo off the 200-row viewport — ff2e214a / 9f00a450). The stream
+        itself carries the ASCII submission marker within the post-dispatch
+        buffer; observing it arms the latch before any scrolled completion
+        needs it.
+        """
+        provider = _code_provider("echo-stream-arm")
+        provider.mark_input_received()
+        assert provider._styled_turn_echo_seen is False
+        provider.observe_execution_output(
+            "\x1b]133;A\x07 \x1b[38;5;222m\x1b[1m✨\x1b[0m go", 0, truncated=False
+        )
+        assert provider._styled_turn_echo_seen is True
+
+    def test_stream_marker_before_dispatch_does_not_arm(self):
+        """Pre-dispatch bytes (previous turn, uncleared buffer) must not arm."""
+        provider = _code_provider("echo-stream-pre-dispatch")
+        provider.observe_execution_output("\x1b]133;A\x07 old turn", 0, truncated=False)
+        assert provider._styled_turn_echo_seen is False
+
+    def test_scrolled_completion_via_stream_armed_latch(self):
+        """The 9f00a450 scenario: stream arms the latch; scrolled final completes."""
+        raw_rows, clean_rows = self._styled_rows()
+        provider = _code_provider("echo-stream-scrolled")
+        provider.mark_input_received()
+        provider.observe_execution_output("\x1b]133;A\x07 ✨ do work", 0, truncated=False)
+        assert provider.get_status_from_styled_screen(raw_rows, clean_rows) is (
+            TerminalStatus.COMPLETED
+        )
