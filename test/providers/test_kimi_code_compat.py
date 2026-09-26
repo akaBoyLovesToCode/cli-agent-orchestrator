@@ -1020,6 +1020,13 @@ def _make_source_home(root: Path) -> Path:
     for name in PRESERVE_DIRS:
         (root / name).mkdir()
         (root / name / "entry.txt").write_text("x")
+    # Step 4F: OAuth state is *shared* (directory links), not copied. Both
+    # entries pre-exist here, as they do in a real logged-in home, so the build
+    # has no reason to create the source ``oauth/`` directory itself.
+    (root / "credentials").mkdir()
+    (root / "credentials" / "kimi-code.json").write_text('{"refreshToken": "R1"}')
+    (root / "oauth").mkdir()
+    (root / "oauth" / "kimi-code").write_text("")
     (root / "bin").mkdir()
     (root / "bin" / "kimi").write_text("#!/bin/sh\n")
     # A4: workspace-trust is a snapshot-copied security input, no longer part of
@@ -1072,6 +1079,22 @@ class TestKimiRuntimeHomeBuilder:
         linked = result.home / "bin"
         assert linked.is_symlink()
         assert result.linked_dirs == ["bin"]
+
+    def test_auth_state_is_shared_not_copied(self, tmp_path):
+        """Step 4F: one authoritative OAuth lineage across workers and normal
+        Kimi — ``credentials/`` and ``oauth/`` are directory links, so a
+        refresh-token rotation performed by any process is immediately visible
+        to all of them, and all refreshes share one lock domain."""
+
+        source = _make_source_home(tmp_path / "src")
+        result = KimiCodeRuntimeHomeBuilder(source, tmp_path / "temp").build()
+        assert result.shared_auth_dirs == ["credentials", "oauth"]
+        for name in ("credentials", "oauth"):
+            link = result.home / name
+            assert link.is_symlink(), name
+            assert Path(os.path.realpath(link)) == Path(os.path.realpath(source / name))
+        # The credential content is the source's own, read through the link.
+        assert "R1" in (result.home / "credentials" / "kimi-code.json").read_text()
 
     def test_home_dir_is_private(self, tmp_path):
         source = _make_source_home(tmp_path / "src")
@@ -1223,8 +1246,15 @@ class TestKimiRuntimeHomeSymlinks:
         assert sorted(p.name for p in external.iterdir()) == before_target
         assert external.stat().st_mtime_ns == before_mtime
 
-    def test_symlinked_credentials_are_materialised_and_private(self, tmp_path):
-        """A credential-bearing link gets explicit treatment, not traversal."""
+    def test_symlinked_credentials_are_shared_at_their_own_path(self, tmp_path):
+        """Step 4F — credentials are *shared*, never materialised.
+
+        An operator who symlinks ``credentials/`` elsewhere has arranged their
+        own authoritative store. The runtime home links the source path as-is
+        (link-to-link, the documented ``bin/`` policy), so reads and Kimi's
+        atomic rotation writes resolve to the real store, and the build never
+        re-permissions the operator's files.
+        """
 
         external = tmp_path / "external-creds"
         external.mkdir()
@@ -1235,13 +1265,18 @@ class TestKimiRuntimeHomeSymlinks:
         source, builder = self._builder_with_link(tmp_path, "credentials", external)
         result = builder.build()
 
-        copied = result.home / "credentials" / "token.json"
-        assert copied.is_file()
-        assert not (result.home / "credentials").is_symlink()
-        # Never widen: a 0644 source becomes 0600 inside the runtime home.
-        assert stat.S_IMODE(os.stat(copied).st_mode) == 0o600
-        assert stat.S_IMODE(os.stat(result.home / "credentials").st_mode) == 0o700
-        assert result.symlinked_dirs == {"credentials": str(external)}
+        link = result.home / "credentials"
+        assert link.is_symlink()
+        assert os.readlink(link) == str(source / "credentials")
+        assert (link / "token.json").is_file()
+        # Credentials resolve to a real store, so the oauth lock domain is
+        # shared too — created in the source home when absent, exactly as Kimi
+        # would create it on first refresh.
+        assert result.shared_auth_dirs == ["credentials", "oauth"]
+        assert (result.home / "oauth").is_symlink()
+        # The source's own permissions are its own business: never widened,
+        # never narrowed, by a build.
+        assert stat.S_IMODE(os.stat(secret).st_mode) == 0o644
 
     def test_symlink_to_non_directory_is_skipped(self, tmp_path):
         """A link to a file is not a directory to preserve."""

@@ -47,6 +47,41 @@ retains an internal symlink that could reach back out of the snapshot. See
 Preserving an existing decision is not the same as making a new one: a folder
 the operator has *not* trusted still produces a dialog, and the provider still
 fails closed without the explicit opt-in.
+
+**OAuth state (Step 4F).** ``credentials/`` and ``oauth/`` are the one
+deliberate exception to "copied, never shared". Kimi Code rotates OAuth refresh
+tokens on use (a refresh response carrying a new ``refresh_token`` is persisted
+in its place) and serialises cross-process refreshes through a
+``proper-lockfile`` directory at ``<KIMI_CODE_HOME>/oauth/<profile>.lock``,
+re-reading the credential store after lock acquisition and adopting a token
+another process rotated in. Both the credential store
+(``credentials/<profile>.json``) and the lock domain therefore derive from
+``KIMI_CODE_HOME`` — and a per-worker *copy* splits both:
+
+* the worker's refresh rotates the token, but the new generation is written
+  only into the disposable home and deleted with it, leaving the operator's
+  store holding a server-invalidated refresh token; the next standalone
+  ``kimi`` refresh is rejected and Kimi writes a *revoked tombstone* over the
+  operator's credential — the production "Stored token ... was rejected;
+  re-login required" failure; and
+* each worker's private ``oauth/`` directory is a *separate lock domain*, so
+  the re-read-and-adopt coordination cannot see a concurrent standalone
+  refresh at all.
+
+There is no official auth-path override (no env var, no config key; the CLI
+wires ``KIMI_CODE_HOME`` straight into the OAuth toolkit's ``homeDir``), so the
+only correct shape is to share exactly the two Kimi-owned auth paths as
+**directory symlinks** into the source home. Directory level matters: Kimi's
+atomic save renames a sibling temp file over ``<profile>.json``, and a rename
+over a *file* symlink replaces the link — silently re-splitting the lineage.
+With the directory linked, the temp file and the rename both happen inside the
+shared store. See :data:`SHARED_AUTH_DIRS`.
+
+Sharing is scoped to those two paths and nothing else: the worker process could
+already *read* the credentials (they were previously copied to it), and the new
+*write* exposure is exactly the rotation channel Kimi owns. Every other piece
+of state — ``mcp.json``, sessions, logs, cache, telemetry, history, trust
+records — remains per-worker and disposable.
 """
 
 from __future__ import annotations
@@ -98,7 +133,10 @@ DEFAULT_SOURCE_HOME_DIR_NAME = ".kimi-code"
 PRESERVE_FILES: Sequence[str] = ("config.toml", "tui.toml", "AGENTS.md", "mcp.json")
 
 #: Directories that carry user semantics and are copied when present.
-PRESERVE_DIRS: Sequence[str] = ("skills", "plugins", "credentials")
+#:
+#: ``credentials`` is deliberately **absent** as of Step 4F: OAuth state is
+#: shared, never snapshotted — see :data:`SHARED_AUTH_DIRS`.
+PRESERVE_DIRS: Sequence[str] = ("skills", "plugins")
 
 #: Kimi Code's workspace-trust store (A4). Snapshot-copied into every worker's
 #: runtime home so a decision the operator already made in normal Kimi is
@@ -164,8 +202,55 @@ MAX_TRUST_ENTRIES = 4096
 #:   ``os.readlink`` sees the intermediate link rather than the final target.
 LINK_DIRS: Sequence[str] = ("bin",)
 
+#: Name of Kimi Code's OAuth credential store directory.
+CREDENTIALS_DIR_NAME = "credentials"
+
+#: Name of Kimi Code's OAuth lock/coordination directory. ``proper-lockfile``
+#: locks the sentinel ``oauth/<profile>`` by creating ``oauth/<profile>.lock``
+#: next to it; the directory is created by Kimi on first refresh.
+OAUTH_DIR_NAME = "oauth"
+
+#: Kimi-owned authentication state **shared** with the source home as directory
+#: symlinks (Step 4F) — the one deliberate exception to "copied, never shared".
+#:
+#: All Kimi processes that authenticate as the same user must share ONE
+#: authoritative refresh-token lineage and the synchronization domain that
+#: protects it. Kimi's own design assumes exactly that: it persists a rotated
+#: ``refresh_token`` in place of the old one (atomically, temp file + rename,
+#: 0600), serialises concurrent refreshes with a ``proper-lockfile`` lock at
+#: ``oauth/<profile>.lock``, and re-reads the store after acquiring the lock so
+#: a token rotated by another process is adopted instead of re-refreshed. A
+#: per-worker credential *copy* breaks every leg of that triangle: the rotated
+#: generation dies with the disposable home, the operator's store keeps a
+#: server-invalidated token whose next use is tombstoned as revoked, and the
+#: per-worker ``oauth/`` directory makes the lock a private domain that cannot
+#: coordinate with standalone Kimi at all.
+#:
+#: The link is at **directory** level, not file level, because Kimi's atomic
+#: save renames a sibling temp file over ``credentials/<profile>.json`` — a
+#: rename over a *file* symlink replaces the link with a real file, silently
+#: re-splitting the lineage on the worker's first refresh. With the directory
+#: linked, the temp file and rename happen inside the shared store.
+#:
+#: Threat model: the worker process could already read the credentials (they
+#: were previously copied into its home), so sharing does not broaden read
+#: access. Write access is the intended rotation channel and is scoped to
+#: exactly these two Kimi-owned paths; no unrelated source-home file is
+#: reachable through them. ``cleanup()`` and the launch-time reset use
+#: ``shutil.rmtree``, which unlinks symlinks without following them, so shared
+#: auth state survives worker teardown — by design. A worker running Kimi's
+#: ``/logout`` would delete the shared credential; CAO never issues ``/logout``
+#: (workers are terminated with ``/exit``), and this is recorded as an accepted
+#: trade-off rather than guarded against.
+SHARED_AUTH_DIRS: Sequence[str] = (CREDENTIALS_DIR_NAME, OAUTH_DIR_NAME)
+
 #: Files whose *contents* are secrets. Always written 0600.
 SECRET_FILE_NAMES: Sequence[str] = ("config.toml", "mcp.json")
+#: Directory names that must use the secret copy policy if they ever appear in
+#: :data:`PRESERVE_DIRS`. No current entry does — since Step 4F
+#: ``credentials/`` is *shared* (:data:`SHARED_AUTH_DIRS`), not copied — so
+#: this list is the guard that keeps a future secret preserve entry safe, not
+#: a live policy.
 SECRET_DIR_NAMES: Sequence[str] = ("credentials",)
 
 #: Runtime-generated state that must stay isolated. Listed for documentation and
@@ -211,6 +296,13 @@ class RuntimeHomeResult:
     copied_files: List[str] = field(default_factory=list)
     copied_dirs: List[str] = field(default_factory=list)
     linked_dirs: List[str] = field(default_factory=list)
+    #: Step 4F — auth directories *shared* with the source home as symlinks
+    #: (:data:`SHARED_AUTH_DIRS`). Recorded separately from ``linked_dirs``
+    #: because the semantics differ fundamentally: ``bin`` is linked because it
+    #: is large and read-only in practice; these are linked because OAuth
+    #: refresh-token rotation and the refresh lock require one authoritative,
+    #: writable, shared state.
+    shared_auth_dirs: List[str] = field(default_factory=list)
     mcp_server_names: List[str] = field(default_factory=list)
     profile_overrode: List[str] = field(default_factory=list)
     #: Preserved directories whose source entry was a symlink. The entry is
@@ -495,6 +587,8 @@ class KimiCodeRuntimeHomeBuilder:
                 except OSError as exc:  # pragma: no cover - platform dependent
                     logger.warning("Could not link %s into runtime home: %s", src, exc)
 
+        shared_auth_dirs = self._link_shared_auth_dirs()
+
         user_servers = read_user_mcp_servers(self._home / "mcp.json")
         profile_names = {str(n) for n in (profile_mcp_servers or {})}
         merged = merge_mcp_servers(user_servers, profile_mcp_servers)
@@ -506,6 +600,7 @@ class KimiCodeRuntimeHomeBuilder:
             copied_files=copied_files,
             copied_dirs=copied_dirs,
             linked_dirs=linked_dirs,
+            shared_auth_dirs=shared_auth_dirs,
             mcp_server_names=sorted(merged),
             profile_overrode=sorted(profile_names & set(user_servers)),
             symlinked_dirs=symlinked_dirs,
@@ -518,7 +613,7 @@ class KimiCodeRuntimeHomeBuilder:
         self._result = result
         logger.info(
             "kimi_runtime_home_built home=%s source=%s servers=%s profile_overrides=%s "
-            "trust=%s records=%d truncated=%s",
+            "trust=%s records=%d truncated=%s shared_auth=%s",
             self._home,
             self._source,
             result.mcp_server_names,
@@ -526,6 +621,7 @@ class KimiCodeRuntimeHomeBuilder:
             trust_state,
             len(trust_records),
             trust_truncated,
+            result.shared_auth_dirs,
         )
         return result
 
@@ -556,6 +652,78 @@ class KimiCodeRuntimeHomeBuilder:
             return False
         self._result = None
         return not self._home.exists()
+
+    # -- shared OAuth state (Step 4F) ---------------------------------------
+
+    def _link_shared_auth_dirs(self) -> List[str]:
+        """Link Kimi-owned auth state into the runtime home (Step 4F).
+
+        ``credentials/`` and ``oauth/`` become directory symlinks into the
+        source home so the worker, every other worker, and standalone Kimi all
+        resolve ONE credential store and ONE refresh-lock domain. The full
+        rationale lives on :data:`SHARED_AUTH_DIRS`; the mechanics here are:
+
+        * a real source directory (or a source symlink resolving to one — the
+          operator's own arrangement, linked at its own path exactly like
+          ``bin/``) is linked;
+        * a missing :data:`OAUTH_DIR_NAME` is created in the source home at
+          0700 — but only when credentials are actually being shared. Kimi
+          creates this directory itself on first refresh; creating it here
+          keeps the worker inside the shared lock domain from its very first
+          refresh instead of letting it build a private one in the disposable
+          home. A home with no credentials (logged out) is never mutated;
+        * a source entry that exists but is not a directory (a regular file, a
+          dangling symlink) is refused with a warning: the worker launches
+          without shared auth and Kimi's own auth error surfaces, rather than
+          the launch failing or a half-shared state being built;
+        * the source is only ever *linked* (and, in the one case above, given
+          an empty Kimi-owned directory): this method never writes, chmods, or
+          deletes inside an existing source directory.
+
+        Link failures degrade to "worker without shared auth" with a warning
+        rather than aborting the launch, matching the :data:`LINK_DIRS`
+        policy.
+        """
+
+        linked: List[str] = []
+        for name in SHARED_AUTH_DIRS:
+            src = self._source / name
+            dst = self._home / name
+            if os.path.lexists(dst):
+                # Defensive: the home is created empty by build(), so an entry
+                # here means the preserve loop grew a conflicting name.
+                logger.warning("kimi_runtime_home_auth_skip name=%s reason=dst-exists", name)
+                continue
+            if not src.is_dir():
+                if name == OAUTH_DIR_NAME and not os.path.lexists(src):
+                    if not (self._source / CREDENTIALS_DIR_NAME).is_dir():
+                        # No credentials shared -> no auth in use -> leave a
+                        # logged-out home untouched.
+                        continue
+                    try:
+                        src.mkdir(mode=0o700, parents=True, exist_ok=True)
+                    except OSError as exc:
+                        logger.warning(
+                            "kimi_runtime_home_auth_skip name=%s reason=create-failed err=%s",
+                            name,
+                            exc,
+                        )
+                        continue
+                else:
+                    if os.path.lexists(src):
+                        logger.warning(
+                            "kimi_runtime_home_auth_skip name=%s reason=not-a-directory", name
+                        )
+                    # Absent state (e.g. logged out) is ordinary: nothing to share.
+                    continue
+            try:
+                os.symlink(src, dst, target_is_directory=True)
+                linked.append(name)
+            except OSError as exc:
+                logger.warning(
+                    "kimi_runtime_home_auth_skip name=%s reason=link-failed err=%s", name, exc
+                )
+        return linked
 
     # -- filesystem helpers ----------------------------------------------
 
@@ -912,15 +1080,17 @@ class KimiCodeRuntimeHomeBuilder:
         the absolute target they named in the source home (see
         :meth:`_rebase_external_relative_links`).
 
-        For a **secret** tree (``credentials/``, see :data:`SECRET_DIR_NAMES`)
-        that policy is wrong. A reproduced link is a *writable path from the
-        disposable runtime home back into shared or source state*: a Kimi write
-        through the runtime copy would mutate the operator's real credential
-        file. Secret trees therefore use :meth:`_copy_secret_tree`, which
+        For a **secret** tree (see :data:`SECRET_DIR_NAMES`) that policy is
+        wrong. A reproduced link is a *writable path from the disposable
+        runtime home back into shared or source state*: a Kimi write through
+        the runtime copy would mutate the operator's real credential file.
+        Secret trees therefore use :meth:`_copy_secret_tree`, which
         materialises ordinary regular files as real 0600 files and *skips* every
         symlink instead of reproducing it. That is the same conservative policy
         :meth:`_copy_trust_tree` already applies to trust state, for the same
-        reason.
+        reason. (No current :data:`PRESERVE_DIRS` entry is secret —
+        ``credentials/`` has been *shared*, not copied, since Step 4F — so this
+        branch is the standing guard for a future secret entry.)
         """
 
         if secret:

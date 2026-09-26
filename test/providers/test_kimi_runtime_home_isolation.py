@@ -1,25 +1,43 @@
 """Security isolation tests for the per-worker Kimi runtime home.
 
-Two independently reproduced findings live here:
-
 **Finding 1 (P2).** ``_copy_tree`` passes ``symlinks=True`` so an *internal*
-symlink under ``credentials/`` (a member of :data:`SECRET_DIR_NAMES`) was
-reproduced verbatim into the runtime home. Writing through the runtime copy then
-wrote through the link back into shared/source state. Secret credential state
-must never contain a writable path back out of the runtime home, so the secret
-copy policy is deliberately not the ordinary ``skills``/``plugins`` policy.
+symlink under a secret directory (see :data:`SECRET_DIR_NAMES`) was reproduced
+verbatim into the runtime home. Writing through the runtime copy then wrote
+through the link back into shared/source state. A copied secret tree must never
+contain a writable path back out of the runtime home, so the secret copy policy
+is deliberately not the ordinary ``skills``/``plugins`` policy. The policy is
+now covered by exercising :meth:`KimiCodeRuntimeHomeBuilder._copy_secret_tree`
+directly: as of Step 4F no preserved directory is secret any more, because
+``credentials/`` is *shared* rather than copied (see :data:`SHARED_AUTH_DIRS`),
+and the guard is what keeps a future secret entry in :data:`PRESERVE_DIRS`
+safe.
 
 **Finding 2 (P3).** ``_copy_trust_tree`` did ``entries = sorted(scan, ...)``,
 which materialised the *entire* source directory before :data:`MAX_TRUST_ENTRIES`
 was applied. The record count was bounded but the enumeration, allocation and
 scandir consumption were not.
 
+**Step 4F — shared OAuth state.** Kimi Code rotates OAuth refresh tokens on use
+and serialises cross-process refreshes through a ``proper-lockfile`` lock under
+``oauth/``; both the credential store (``credentials/<name>.json``) and the lock
+domain (``oauth/<name>.lock``) derive from ``KIMI_CODE_HOME``. Snapshot-copying
+``credentials/`` into a disposable runtime home therefore stranded the rotated
+token in the worker and left the operator's store holding a stale,
+server-invalidated refresh token — which the next standalone refresh turned
+into a revoked tombstone ("Stored token ... was rejected; re-login required").
+``credentials/`` and ``oauth/`` are now directory *symlinks* to the source home:
+the one deliberate exception to the no-escape invariant, scoped to exactly the
+two auth paths that must share one authoritative lineage. Everything else in
+the runtime home still satisfies the no-escape invariant.
+
 All tests use ``tmp_path`` only; the real ``~/.kimi-code`` is never touched.
 """
 
 from __future__ import annotations
 
+import json
 import os
+import shutil
 import stat
 from pathlib import Path
 from typing import Any, Dict
@@ -52,144 +70,206 @@ def _assert_no_escape(root: Path) -> None:
         assert real.is_relative_to(resolved_root), f"{path} escapes to {real}"
 
 
-class TestCredentialSymlinkIsolation:
-    """Finding 1 — secret trees never retain a writable path out."""
+def _make_auth_source(source: Path, token: str = "R1") -> Path:
+    """A source home holding a synthetic OAuth credential and lock sentinel."""
 
-    def test_internal_relative_file_symlink_is_not_reproduced(self, tmp_path, caplog):
-        source = tmp_path / "src"
-        creds = source / "credentials"
-        creds.mkdir(parents=True)
-        (creds / "real.json").write_text("real")
-        (creds / "alias.json").symlink_to("real.json")
+    creds = source / "credentials"
+    creds.mkdir(parents=True)
+    (creds / "kimi-code.json").write_text(
+        json.dumps({"accessToken": "A1", "refreshToken": token}), encoding="utf-8"
+    )
+    oauth = source / "oauth"
+    oauth.mkdir()
+    (oauth / "kimi-code").write_text("", encoding="utf-8")
+    return source
 
-        result = _build(source, tmp_path / "temp")
 
-        runtime = result.home / "credentials"
-        _assert_no_escape(runtime)
-        assert (runtime / "real.json").read_text() == "real"
-        assert not (runtime / "alias.json").is_symlink()
+class TestSharedAuthState:
+    """Step 4F — ``credentials/`` and ``oauth/`` are shared, never snapshotted.
 
-    def test_internal_directory_symlink_is_not_followed(self, tmp_path, caplog):
-        source = tmp_path / "src"
-        creds = source / "credentials"
-        creds.mkdir(parents=True)
-        external = tmp_path / "external-creds"
-        (external / "deep").mkdir(parents=True)
-        (external / "deep" / "token.json").write_text("external-token")
-        (creds / "linked-dir").symlink_to(external, target_is_directory=True)
+    Kimi's own multi-process coordination (a ``proper-lockfile`` lock plus a
+    re-read-and-adopt after lock acquisition) only works when every process
+    that authenticates as the same user resolves the *same* credential file and
+    the *same* lock domain. Per-worker copies gave each worker a private lock
+    domain and a private credential generation, which is exactly the shape that
+    produced the production "re-login required" rejections.
+    """
 
-        external_before = {
-            str(p.relative_to(external)): p.read_bytes() for p in external.rglob("*") if p.is_file()
-        }
+    def test_credentials_and_oauth_are_directory_links_to_the_source(self, tmp_path):
+        source = _make_auth_source(tmp_path / "src")
 
         result = _build(source, tmp_path / "temp")
 
-        runtime = result.home / "credentials"
-        _assert_no_escape(runtime)
-        assert not (runtime / "linked-dir").exists()
-        assert not (runtime / "linked-dir" / "deep" / "token.json").exists()
-        after = {
-            str(p.relative_to(external)): p.read_bytes() for p in external.rglob("*") if p.is_file()
-        }
-        assert after == external_before
+        creds_link = result.home / "credentials"
+        oauth_link = result.home / "oauth"
+        assert creds_link.is_symlink()
+        assert oauth_link.is_symlink()
+        assert Path(os.path.realpath(creds_link)) == Path(os.path.realpath(source / "credentials"))
+        assert Path(os.path.realpath(oauth_link)) == Path(os.path.realpath(source / "oauth"))
+        assert result.shared_auth_dirs == ["credentials", "oauth"]
+        # The worker reads the operator's current credential through the link.
+        assert json.loads((creds_link / "kimi-code.json").read_text())["refreshToken"] == "R1"
 
-    def test_relative_symlink_to_target_outside_source_home(self, tmp_path):
+    def test_atomic_rotation_through_the_worker_is_visible_at_the_source(self, tmp_path):
+        """The exact Step 4F rotation: R1 -> R2 must land in the shared store.
+
+        Kimi's ``FileTokenStorage.save`` writes ``<name>.json.tmp.<pid>.<rand>``
+        next to the target and atomically renames it over ``<name>.json``.
+        Through a *directory* link that dance happens inside the shared store,
+        so the link survives and every reader sees the new generation. (A
+        file-level link would instead be *replaced* by the rename, silently
+        re-splitting the lineage — that is why the link is at directory level.)
+        """
+
+        source = _make_auth_source(tmp_path / "src")
+
+        result = _build(source, tmp_path / "temp")
+        worker_creds = result.home / "credentials"
+
+        # Simulate Kimi's atomic save through the worker-visible path.
+        tmp = worker_creds / "kimi-code.json.tmp.1234.abcd"
+        tmp.write_text(json.dumps({"accessToken": "A2", "refreshToken": "R2"}), encoding="utf-8")
+        os.rename(tmp, worker_creds / "kimi-code.json")
+
+        assert (
+            json.loads((source / "credentials" / "kimi-code.json").read_text())["refreshToken"]
+            == "R2"
+        )
+        assert worker_creds.is_symlink(), "the rename must not replace the directory link"
+        # A second worker home observes the same generation.
+        other = _build(source, tmp_path / "temp2")
+        assert (
+            json.loads((other.home / "credentials" / "kimi-code.json").read_text())["refreshToken"]
+            == "R2"
+        )
+
+    def test_two_workers_share_one_lock_domain(self, tmp_path):
+        source = _make_auth_source(tmp_path / "src")
+
+        first = _build(source, tmp_path / "temp1")
+        second = _build(source, tmp_path / "temp2")
+
+        sentinel_a = first.home / "oauth" / "kimi-code"
+        sentinel_b = second.home / "oauth" / "kimi-code"
+        assert os.path.realpath(sentinel_a) == os.path.realpath(sentinel_b)
+        # A lock directory taken through one worker's path is visible through the
+        # other's: one coordination domain, not two.
+        lock_a = first.home / "oauth" / "kimi-code.lock"
+        lock_a.mkdir()
+        assert (second.home / "oauth" / "kimi-code.lock").is_dir()
+        assert (source / "oauth" / "kimi-code.lock").is_dir()
+
+    def test_cleanup_removes_only_the_links_never_the_shared_state(self, tmp_path):
+        source = _make_auth_source(tmp_path / "src")
+        builder = KimiCodeRuntimeHomeBuilder(source, tmp_path / "temp")
+        result = builder.build()
+        assert (result.home / "credentials").is_symlink()
+
+        assert builder.cleanup() is True
+
+        assert not result.home.exists()
+        assert (
+            json.loads((source / "credentials" / "kimi-code.json").read_text())["refreshToken"]
+            == "R1"
+        )
+        assert (source / "oauth" / "kimi-code").is_file()
+
+    def test_rmtree_of_the_terminal_dir_does_not_follow_auth_links(self, tmp_path):
+        """The kimi_cli reset path ``shutil.rmtree(terminal_dir)`` must unlink
+        the auth links, never delete through them into the operator's store."""
+
+        source = _make_auth_source(tmp_path / "src")
+        terminal_dir = tmp_path / "terminal"
+        result = _build(source, terminal_dir)
+
+        shutil.rmtree(terminal_dir)
+
+        assert not terminal_dir.exists()
+        assert (
+            json.loads((source / "credentials" / "kimi-code.json").read_text())["refreshToken"]
+            == "R1"
+        )
+        assert (source / "oauth").is_dir()
+        assert result.home  # silence unused-result lint; the build succeeded
+
+    def test_absent_source_auth_state_links_nothing(self, tmp_path):
+        """A logged-out source home yields no auth entries and no crash."""
+
         source = tmp_path / "src"
-        creds = source / "credentials"
-        creds.mkdir(parents=True)
-        shared = tmp_path / "shared-rel-token.json"
-        shared.write_text("shared-original")
-        relative = os.path.relpath(shared, creds)
-        (creds / "rel.json").symlink_to(relative)
+        source.mkdir()
 
         result = _build(source, tmp_path / "temp")
 
-        runtime = result.home / "credentials"
-        _assert_no_escape(runtime)
-        assert not (runtime / "rel.json").is_symlink()
-        assert shared.read_text() == "shared-original"
+        assert result.shared_auth_dirs == []
+        assert not (result.home / "credentials").exists()
+        assert not (result.home / "oauth").exists()
+        # A logged-out home is never mutated: no oauth directory is synthesised.
+        assert not (source / "oauth").exists()
 
-    def test_absolute_symlink_to_target_outside_source_home(self, tmp_path):
-        source = tmp_path / "src"
-        creds = source / "credentials"
-        creds.mkdir(parents=True)
-        shared = tmp_path / "shared-abs-token.json"
-        shared.write_text("shared-original")
-        (creds / "abs.json").symlink_to(shared)
-
-        result = _build(source, tmp_path / "temp")
-
-        runtime = result.home / "credentials"
-        _assert_no_escape(runtime)
-        assert not (runtime / "abs.json").is_symlink()
-        assert shared.read_text() == "shared-original"
-
-    def test_dangling_symlink_is_skipped_without_aborting(self, tmp_path):
-        source = tmp_path / "src"
-        creds = source / "credentials"
-        creds.mkdir(parents=True)
-        (creds / "kept.json").write_text("kept")
-        (creds / "dangling.json").symlink_to(creds / "missing.json")
-
-        result = _build(source, tmp_path / "temp")
-
-        runtime = result.home / "credentials"
-        _assert_no_escape(runtime)
-        assert (runtime / "kept.json").read_text() == "kept"
-
-    def test_ordinary_credential_file_is_a_real_private_copy(self, tmp_path):
-        source = tmp_path / "src"
-        creds = source / "credentials"
-        creds.mkdir(parents=True)
-        plain = creds / "plain.json"
-        plain.write_text("plain")
-        os.chmod(plain, 0o644)
-
-        result = _build(source, tmp_path / "temp")
-
-        runtime = result.home / "credentials"
-        copied = runtime / "plain.json"
-        assert copied.is_file()
-        assert not copied.is_symlink()
-        assert copied.read_text() == "plain"
-        assert stat.S_IMODE(os.stat(copied).st_mode) == 0o600
-        assert stat.S_IMODE(os.stat(runtime).st_mode) == 0o700
-
-    def test_writing_the_runtime_copy_cannot_mutate_source_or_target(self, tmp_path):
-        """The exact reproduction: a shared target must stay unchanged."""
+    def test_source_oauth_dir_is_created_when_credentials_are_shared(self, tmp_path):
+        """Kimi creates ``oauth/`` on first refresh; creating it here keeps the
+        worker in the shared lock domain from its very first refresh instead of
+        letting it build a private one inside the disposable home."""
 
         source = tmp_path / "src"
         creds = source / "credentials"
         creds.mkdir(parents=True)
-        shared = tmp_path / "shared-token.json"
-        shared.write_text("shared-original")
-        link = creds / "token.json"
-        link.symlink_to(shared)
-        (creds / "plain.json").write_text("plain-original")
+        (creds / "kimi-code.json").write_text("{}", encoding="utf-8")
 
         result = _build(source, tmp_path / "temp")
-        runtime = result.home / "credentials"
 
-        # Simulate Kimi writing credentials during a real run: overwrite the
-        # runtime plain copy and re-create the linked name as a regular file.
-        (runtime / "plain.json").write_text("plain-tampered")
-        (runtime / "token.json").write_text("tampered")
-
-        assert shared.read_text() == "shared-original"
+        assert (source / "oauth").is_dir()
+        assert stat.S_IMODE(os.stat(source / "oauth").st_mode) == 0o700
+        link = result.home / "oauth"
         assert link.is_symlink()
-        assert os.readlink(link) == str(shared)
-        assert (creds / "plain.json").read_text() == "plain-original"
+        assert Path(os.path.realpath(link)) == Path(os.path.realpath(source / "oauth"))
+        assert result.shared_auth_dirs == ["credentials", "oauth"]
 
-    def test_source_credential_tree_is_not_mutated_by_the_build(self, tmp_path):
+    def test_a_regular_file_named_credentials_fails_closed(self, tmp_path, caplog):
+        """A non-directory ``credentials`` is pathological: skip it, keep the
+        build alive, and let Kimi's own auth error surface in the worker."""
+
         source = tmp_path / "src"
-        creds = source / "credentials"
-        creds.mkdir(parents=True)
-        (creds / "real.json").write_text("real")
-        (creds / "alias.json").symlink_to("real.json")
-        external = tmp_path / "external"
-        external.mkdir()
-        (external / "t").write_text("t")
-        (creds / "dir-link").symlink_to(external, target_is_directory=True)
+        source.mkdir()
+        (source / "credentials").write_text("not-a-directory")
+
+        result = _build(source, tmp_path / "temp")
+
+        assert result.shared_auth_dirs == []
+        assert not (result.home / "credentials").exists()
+        assert not (source / "oauth").exists(), "no credentials shared -> no oauth dir created"
+
+    def test_a_dangling_source_credentials_symlink_fails_closed(self, tmp_path, caplog):
+        source = tmp_path / "src"
+        source.mkdir()
+        (source / "credentials").symlink_to(source / "gone", target_is_directory=True)
+
+        result = _build(source, tmp_path / "temp")
+
+        assert result.shared_auth_dirs == []
+        assert not os.path.lexists(result.home / "credentials")
+
+    def test_a_symlinked_source_credentials_dir_is_shared_at_its_own_path(self, tmp_path):
+        """An operator who links ``credentials`` elsewhere has arranged their own
+        authoritative store; the worker links the same path (link-to-link, the
+        documented ``bin/`` policy) and resolution lands on the real store."""
+
+        source = tmp_path / "src"
+        source.mkdir()
+        real = tmp_path / "real-creds"
+        real.mkdir()
+        (real / "kimi-code.json").write_text('{"refreshToken": "R1"}', encoding="utf-8")
+        (source / "credentials").symlink_to(real, target_is_directory=True)
+
+        result = _build(source, tmp_path / "temp")
+
+        link = result.home / "credentials"
+        assert link.is_symlink()
+        assert json.loads((link / "kimi-code.json").read_text())["refreshToken"] == "R1"
+        assert result.shared_auth_dirs == ["credentials", "oauth"]
+
+    def test_the_build_never_mutates_source_permissions_or_content(self, tmp_path):
+        source = _make_auth_source(tmp_path / "src")
 
         def snapshot(root: Path) -> Dict[str, Any]:
             out: Dict[str, Any] = {}
@@ -204,12 +284,87 @@ class TestCredentialSymlinkIsolation:
             return out
 
         before = snapshot(source)
-        external_before = snapshot(external)
 
         _build(source, tmp_path / "temp")
 
         assert snapshot(source) == before
-        assert snapshot(external) == external_before
+
+    def test_mcp_json_and_runtime_state_stay_isolated(self, tmp_path):
+        """Sharing auth state must not widen sharing beyond the two auth paths."""
+
+        source = _make_auth_source(tmp_path / "src")
+        (source / "mcp.json").write_text('{"mcpServers": {"user": {"command": "x"}}}')
+        (source / "sessions").mkdir()
+        (source / "sessions" / "s.json").write_text("{}")
+
+        result = _build(source, tmp_path / "temp")
+
+        mcp = result.home / "mcp.json"
+        assert mcp.is_file() and not mcp.is_symlink()
+        assert not (result.home / "sessions").exists()
+        # Writes to the worker's mcp.json cannot reach the source file.
+        before = (source / "mcp.json").read_text()
+        mcp.write_text('{"mcpServers": {}}')
+        assert (source / "mcp.json").read_text() == before
+
+
+class TestSecretTreeCopyPolicy:
+    """Finding 1 (P2) — the secret copy policy keeps no writable path out.
+
+    Since Step 4F no preserved directory is secret, so nothing routes through
+    :meth:`KimiCodeRuntimeHomeBuilder._copy_secret_tree` by default. The policy
+    remains the guard that makes a *future* secret entry in
+    :data:`PRESERVE_DIRS` safe, so it is exercised directly here.
+    """
+
+    @staticmethod
+    def _copy(src: Path, dst: Path) -> None:
+        KimiCodeRuntimeHomeBuilder._copy_secret_tree(src, dst)
+
+    def test_internal_symlinks_are_not_reproduced(self, tmp_path):
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "real.json").write_text("real")
+        (src / "alias.json").symlink_to("real.json")
+        deep = tmp_path / "external" / "deep"
+        deep.mkdir(parents=True)
+        (deep / "token.json").write_text("external-token")
+        (src / "linked-dir").symlink_to(tmp_path / "external", target_is_directory=True)
+
+        dst = tmp_path / "dst"
+        self._copy(src, dst)
+
+        _assert_no_escape(dst)
+        assert (dst / "real.json").read_text() == "real"
+        assert not (dst / "alias.json").exists()
+        assert not (dst / "linked-dir").exists()
+
+    def test_ordinary_files_are_real_private_copies(self, tmp_path):
+        src = tmp_path / "src"
+        src.mkdir()
+        plain = src / "plain.json"
+        plain.write_text("plain")
+        os.chmod(plain, 0o644)
+
+        dst = tmp_path / "dst"
+        self._copy(src, dst)
+
+        copied = dst / "plain.json"
+        assert copied.is_file() and not copied.is_symlink()
+        assert copied.read_text() == "plain"
+        assert stat.S_IMODE(os.stat(copied).st_mode) == 0o600
+        assert stat.S_IMODE(os.stat(dst).st_mode) == 0o700
+
+    def test_writing_the_copy_cannot_mutate_the_source(self, tmp_path):
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "plain.json").write_text("plain-original")
+
+        dst = tmp_path / "dst"
+        self._copy(src, dst)
+        (dst / "plain.json").write_text("tampered")
+
+        assert (src / "plain.json").read_text() == "plain-original"
 
 
 class _CountingScandir:

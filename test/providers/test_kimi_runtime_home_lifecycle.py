@@ -1,8 +1,9 @@
 """Lifecycle tests for the Kimi Code managed runtime home.
 
-**Review C regression.** A worker's ``KIMI_CODE_HOME`` is a snapshot of the
-operator's ``credentials/``, MCP configuration and Kimi state. It used to be
-built under a random ``/tmp/cao_kimi_<random>/kimi-home`` whose path existed only
+**Review C regression.** A worker's ``KIMI_CODE_HOME`` carries the operator's
+credential *link* (Step 4F: ``credentials/`` is shared, not copied), MCP
+configuration and Kimi state. It used to be built under a random
+``/tmp/cao_kimi_<random>/kimi-home`` whose path existed only
 in the live provider instance (``self._temp_dir``). After a cao-server restart the
 provider is reconstructed from terminal metadata, where ``provider_variant`` is
 the only persisted Kimi state, so ``_temp_dir`` was ``None``, ``cleanup()`` was a
@@ -94,8 +95,10 @@ class TestReviewCRestartCleanup:
 
         home = _expected_home(cao_home, "term-restart")
         assert home.is_dir(), "the launch must build the deterministic managed home"
-        copied = home / "credentials" / "auth.json"
-        copied.write_text('{"token": "copied-secret"}', encoding="utf-8")
+        # Step 4F: credentials are *shared* (a directory link into the source
+        # home), never copied — the only credential residue a restart can leave
+        # is the link itself, which is removed with the home.
+        assert (home / "credentials").is_symlink()
 
         # Simulated restart: no provider instance survives, and the surviving DB
         # row records only the launch variant.
@@ -106,10 +109,13 @@ class TestReviewCRestartCleanup:
         ):
             assert manager.cleanup_provider("term-restart") is True
 
-        assert not copied.exists()
         assert not home.exists()
-        # The source home is the operator's real state: never removed.
+        # The source home is the operator's real state: never removed, never
+        # rewritten by the build or the cleanup.
         assert (source / "credentials" / "auth.json").is_file()
+        assert json.loads((source / "credentials" / "auth.json").read_text()) == {
+            "token": "source-secret"
+        }
 
     def test_restart_cleanup_removes_a_home_it_never_built(self, tmp_path, monkeypatch):
         """The recovery path needs nothing but the terminal id and the DB row.

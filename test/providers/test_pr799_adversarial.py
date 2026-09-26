@@ -968,7 +968,16 @@ class TestPR799AdversarialShellTransport:
 
 
 class TestPR799AdversarialCredentialIsolation:
-    """Secret state must not keep a writable path back into shared state."""
+    """Secret state must not keep a writable path back into shared state.
+
+    Step 4F deliberately redefines this for the two Kimi-owned auth paths:
+    ``credentials/`` and ``oauth/`` ARE shared with the source home (directory
+    links), because OAuth refresh-token rotation and the refresh lock require
+    one authoritative lineage (see :data:`SHARED_AUTH_DIRS`). The adversarial
+    invariant that survives is one of *scope*: the auth links must point at
+    exactly the source home's own auth directories, and nothing *else* in the
+    runtime home may gain a writable path out.
+    """
 
     def _source_home(self, root: Path) -> Path:
         source = root / "src"
@@ -977,47 +986,59 @@ class TestPR799AdversarialCredentialIsolation:
         creds = source / "credentials"
         creds.mkdir()
         (creds / "plain.json").write_text('{"token":"PLAIN"}\n', encoding="utf-8")
+        oauth = source / "oauth"
+        oauth.mkdir()
+        (oauth / "kimi-code").write_text("", encoding="utf-8")
         return source
 
-    @pytest.mark.parametrize("link_kind", ["relative", "absolute"])
-    def test_writing_the_runtime_copy_cannot_mutate_the_target(self, tmp_path, link_kind):
+    def test_auth_links_point_exactly_at_the_source_auth_dirs(self, tmp_path):
         source = self._source_home(tmp_path)
-        shared = tmp_path / "shared-token.json"
-        shared.write_text('{"token":"ORIGINAL"}\n', encoding="utf-8")
-        link = source / "credentials" / "token.json"
-        link.symlink_to(shared if link_kind == "absolute" else Path("../shared-token.json"))
 
         result = KimiCodeRuntimeHomeBuilder(source, tmp_path / "runtime").build(None)
-        runtime_token = result.home / "credentials" / "token.json"
 
-        assert not runtime_token.is_symlink()
-        if runtime_token.exists():
-            runtime_token.write_text('{"token":"MUTATED"}\n', encoding="utf-8")
-        assert shared.read_text(encoding="utf-8") == '{"token":"ORIGINAL"}\n'
+        for name in ("credentials", "oauth"):
+            link = result.home / name
+            assert link.is_symlink(), name
+            # The link text is the source home's own directory — never a target
+            # picked up from inside the source tree.
+            assert os.readlink(link) == str(source / name), name
+        assert result.shared_auth_dirs == ["credentials", "oauth"]
 
-    def test_no_symlink_survives_anywhere_under_credentials(self, tmp_path):
+    def test_no_other_writable_path_out_of_the_runtime_home(self, tmp_path):
         source = self._source_home(tmp_path)
-        outside = tmp_path / "outside"
-        outside.mkdir()
-        (outside / "target.json").write_text("{}", encoding="utf-8")
-        (source / "credentials" / "abs.json").symlink_to(outside / "target.json")
-        (source / "credentials" / "dangling.json").symlink_to(tmp_path / "nope")
-        (source / "credentials" / "linkdir").symlink_to(outside, target_is_directory=True)
+        (source / "skills").mkdir()
+        (source / "skills" / "SKILL.md").write_text("s", encoding="utf-8")
 
         result = KimiCodeRuntimeHomeBuilder(source, tmp_path / "runtime").build(None)
-        creds = result.home / "credentials"
-        for root, dirnames, filenames in os.walk(creds):
-            assert not Path(root).is_symlink(), root
-            for entry in list(dirnames) + list(filenames):
-                assert not (Path(root) / entry).is_symlink(), (root, entry)
 
-    def test_ordinary_credential_file_is_still_copied(self, tmp_path):
+        allowed = {"credentials", "oauth"}
+        for path in result.home.rglob("*"):
+            if not path.is_symlink():
+                continue
+            rel = str(path.relative_to(result.home))
+            # The only symlinks that may resolve OUTSIDE the runtime home are
+            # the two deliberate auth links (rglob does not descend into them).
+            real = Path(os.path.realpath(path))
+            if not real.is_relative_to(Path(os.path.realpath(result.home))):
+                assert rel in allowed, f"unexpected escape: {rel} -> {real}"
+
+    def test_rotation_writes_through_the_shared_channel_only(self, tmp_path):
+        """A credential write through the worker path is the intended rotation
+        channel: it lands in the source store atomically and the directory link
+        itself survives the temp-file+rename dance."""
+
         source = self._source_home(tmp_path)
         result = KimiCodeRuntimeHomeBuilder(source, tmp_path / "runtime").build(None)
-        copied = result.home / "credentials" / "plain.json"
-        assert copied.is_file()
-        assert copied.read_text(encoding="utf-8") == '{"token":"PLAIN"}\n'
-        assert (copied.stat().st_mode & 0o777) == 0o600
+        runtime_creds = result.home / "credentials"
+
+        tmp = runtime_creds / "plain.json.tmp.1.abcd"
+        tmp.write_text('{"token":"ROTATED"}\n', encoding="utf-8")
+        os.rename(tmp, runtime_creds / "plain.json")
+
+        assert (source / "credentials" / "plain.json").read_text(
+            encoding="utf-8"
+        ) == '{"token":"ROTATED"}\n'
+        assert runtime_creds.is_symlink()
 
 
 # =============================================================================
