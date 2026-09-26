@@ -1698,6 +1698,44 @@ class TestStaleProcessingRecheckRouting:
 
     @patch("cli_agent_orchestrator.backends.registry.get_backend")
     @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    def test_screen_recheck_ready_verdict_is_not_applied(self, mock_pm, mock_get_backend):
+        """Polls VETO (ERROR) but never CONFIRM completion for screen providers.
+
+        The poll re-check is undebounced — it runs against whatever frame is
+        rendered at poll time, including transient mid-turn repaints whose
+        trailing plan-narration bullet classifies COMPLETED under the styled
+        discriminator (measured on archived f62b90c6 streams). A single
+        undebounced read must not latch a ready status: COMPLETED here is
+        discarded, cached PROCESSING is returned, and the sticky latch is
+        untouched. Genuine completion is owned by the edge-scheduled screen
+        detection and the two-read-confirmed capture path.
+        """
+        mock_get_backend.return_value = _backend(event_inbox=False)
+        provider = MagicMock()
+        provider.supports_screen_detection = True
+        mock_pm.get_provider.return_value = provider
+        sm = self._monitor()
+        sm._detect_screen = MagicMock(return_value=TerminalStatus.COMPLETED)
+
+        assert sm.get_status("t1") is TerminalStatus.PROCESSING
+        assert sm._last_status["t1"] is TerminalStatus.PROCESSING
+
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    def test_screen_recheck_error_verdict_is_still_applied(self, mock_pm, mock_get_backend):
+        """The veto path stays fail-fast on fatal states (e.g. auth refusal)."""
+        mock_get_backend.return_value = _backend(event_inbox=False)
+        provider = MagicMock()
+        provider.supports_screen_detection = True
+        mock_pm.get_provider.return_value = provider
+        sm = self._monitor()
+        sm._detect_screen = MagicMock(return_value=TerminalStatus.ERROR)
+
+        assert sm.get_status("t1") is TerminalStatus.ERROR
+        assert sm._last_status["t1"] is TerminalStatus.ERROR
+
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
     def test_non_screen_provider_keeps_raw_recheck(self, mock_pm, mock_get_backend):
         mock_get_backend.return_value = _backend(event_inbox=False)
         provider = MagicMock()

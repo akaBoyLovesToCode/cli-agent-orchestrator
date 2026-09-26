@@ -865,6 +865,18 @@ class KimiCliProvider(BaseProvider):
         self._turn_activity_seen = False
         self.execution_evidence_ambiguous = False
         self._status_buffer_epoch = 0
+        # Styled-path turn latch: set when a user echo (✨, colour 222) is
+        # visible on ANY get_status_from_styled_screen() frame of the current
+        # turn. A long turn's output can push the echo off the 200-row pyte
+        # viewport before the final answer finishes (measured live: terminal
+        # ff2e214a streamed 1.8 MB, the echo scrolled off, the genuine final
+        # frame had no USER_INPUT row and the turn timed out at 900s). The
+        # echo is positive turn-start evidence seen at the rising edge ~1s
+        # into the turn, long before it can scroll away — latching it lets
+        # the positional discriminator (trailing answer + complete composer)
+        # still recognize the completion on scrolled frames. Reset by
+        # mark_input_received() at each new dispatch.
+        self._styled_turn_echo_seen = False
         # Wallclock of the last send_input() dispatch (terminal_service calls
         # mark_input_received). Used by the newest-TUI status path: right
         # after a paste, the TUI repaints the ready chrome (status bar) before
@@ -923,6 +935,7 @@ class KimiCliProvider(BaseProvider):
         """
         super().mark_input_received()
         self._has_received_input = True
+        self._styled_turn_echo_seen = False
         self._begin_execution_generation()
 
     def _begin_execution_generation(self) -> None:
@@ -2541,6 +2554,12 @@ class KimiCliProvider(BaseProvider):
                 (i for i, k in enumerate(kinds) if k is kt.KimiLineKind.USER_INPUT),
                 default=-1,
             )
+            if echo >= 0:
+                # Positive turn-start evidence on this frame — extend the
+                # turn-scoped latch so a later frame whose echo has scrolled
+                # off the 200-row viewport still counts as mid/post-turn.
+                self._styled_turn_echo_seen = True
+            echo_seen = echo >= 0 or self._styled_turn_echo_seen
             start = echo + 1 if echo >= 0 else 0
             # The composer boundary: ``READY_INPUT_FRAME``/composer rows cut
             # the region even in a torn frame where only part of the box
@@ -2565,9 +2584,9 @@ class KimiCliProvider(BaseProvider):
                 (k for k in reversed(region) if k not in _STYLED_REGION_SKIP_KINDS),
                 None,
             )
-            if echo >= 0 and trailing in kt.ANSWER_KINDS and comp_top is not None:
+            if echo_seen and trailing in kt.ANSWER_KINDS and comp_top is not None:
                 return TerminalStatus.COMPLETED
-            if echo >= 0:
+            if echo_seen:
                 # Turn started, not demonstrably finished: mid-turn slot-empty
                 # gap, or trailing tool/thinking content above the composer.
                 return TerminalStatus.PROCESSING

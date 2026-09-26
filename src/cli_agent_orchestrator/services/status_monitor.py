@@ -917,6 +917,7 @@ class StatusMonitor:
             # Providers without the screen opt-in (kiro_cli etc.) keep the raw
             # re-check; _detect_screen itself degrades to the raw buffer when
             # the render fails.
+            screen_routed = False
             provider: Optional["BaseProvider"]
             try:
                 provider = provider_manager.get_provider(terminal_id)
@@ -928,13 +929,32 @@ class StatusMonitor:
                 and getattr(provider, "supports_screen_detection", False)
             ):
                 fresh = self._detect_screen(terminal_id, provider)
+                screen_routed = True
             else:
                 fresh = self._detect_status(terminal_id, buffer)
             logger.debug(
                 f"get_status [{terminal_id}]: cached=PROCESSING, "
                 f"fresh={fresh.value}, buffer_len={len(buffer)}"
             )
-            if fresh != TerminalStatus.PROCESSING and fresh != TerminalStatus.UNKNOWN:
+            if screen_routed:
+                # Polls VETO, they do not CONFIRM: this re-check is undebounced
+                # (runs on every poll against whatever frame is currently
+                # rendered, including transient mid-turn repaints — measured on
+                # archived streams: a narration bullet sitting above the
+                # composer for a sub-second repaint window classifies
+                # COMPLETED under the positional discriminator). A single
+                # undebounced read must never latch a ready status. ERROR is
+                # still applied — fail-fast on fatal states (the post-
+                # submission auth refusal ends the turn immediately, and
+                # waiting for the debounced edge path would burn the step
+                # timeout). Genuine completion is owned by the edge-scheduled
+                # screen detection (rising edge / 0.2s quiescence, which never
+                # samples mid-burst) and, for wedged panes, by the
+                # two-read-confirmed capture path below. Both outrank polling.
+                if fresh == TerminalStatus.ERROR:
+                    self._apply_detection(terminal_id, fresh)
+                    return fresh
+            elif fresh != TerminalStatus.PROCESSING and fresh != TerminalStatus.UNKNOWN:
                 self._apply_detection(terminal_id, fresh)
                 return fresh
 

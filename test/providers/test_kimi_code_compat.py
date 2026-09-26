@@ -4588,3 +4588,80 @@ class TestCodeAuthFailureDetection:
             "context: 0% (0/1M)\n"
         )
         assert provider.get_status(out) is TerminalStatus.IDLE
+
+
+class TestCodeEchoScrolledCompletion:
+    """Echo-scrolled genuine completion — the ff2e214a timeout incident.
+
+    Terminal ff2e214a (Step-4E investigation smoke) streamed 1.8 MB and its
+    final answer filled the whole 200-row pyte viewport: the user echo (✨,
+    colour 222) scrolled off, so the a5d3196f discriminator — which required
+    a visible echo — parked the genuine completed frame at PROCESSING and
+    the step timed out at 900s. The echo is positive turn-start evidence
+    seen at the rising edge ~1s into the turn, long before it can scroll
+    away, so the provider now latches ``_styled_turn_echo_seen`` per turn
+    (reset by ``mark_input_received``) and the positional discriminator
+    (trailing answer + complete composer) applies to scrolled frames too.
+
+    Fixture: sanitized styled rows of ff2e214a's genuine final frame
+    (149 rows, no USER_INPUT row — echo scrolled; trailing FINAL_BULLET
+    report items; complete composer; status footer).
+    """
+
+    @staticmethod
+    def _styled_rows():
+        raw_rows = [
+            ln
+            for ln in _fixture("kimi_code_210_echo_scrolled_completion.txt").split("\n")
+            if pyte_ansi.strip_sgr(ln).strip()
+        ]
+        clean_rows = [pyte_ansi.strip_sgr(ln).rstrip() for ln in raw_rows]
+        return raw_rows, clean_rows
+
+    def test_fresh_provider_does_not_complete_without_echo(self):
+        """No latch, no echo → not demonstrably a finished turn (pre-4E verdict)."""
+        raw_rows, clean_rows = self._styled_rows()
+        provider = _code_provider("echo-scrolled-fresh")
+        assert provider.get_status_from_styled_screen(raw_rows, clean_rows) is (
+            TerminalStatus.PROCESSING
+        )
+
+    def test_latched_echo_completes_scrolled_final_frame(self):
+        raw_rows, clean_rows = self._styled_rows()
+        provider = _code_provider("echo-scrolled-latched")
+        provider._styled_turn_echo_seen = True
+        assert provider.get_status_from_styled_screen(raw_rows, clean_rows) is (
+            TerminalStatus.COMPLETED
+        )
+
+    def test_seen_echo_latches_for_later_frames(self):
+        """One echo-bearing frame arms the turn; a later scrolled frame completes."""
+        raw_rows, clean_rows = self._styled_rows()
+        provider = _code_provider("echo-scrolled-sequence")
+        # Realistic early-turn frame: echo + complete composer + status footer
+        # (the latch lives in the footer-present branch).
+        echo_rows = [
+            " \x1b[38;5;222m\x1b[1m✨\x1b[0m \x1b[38;5;222mInvestigate the fixture repo read-only.\x1b[0m",
+            " \xe2\x95\xad" + "\xe2\x94\x80" * 20,
+            " \xe2\x94\x82 > ",
+            " \xe2\x95\xb0" + "\xe2\x94\x80" * 20,
+            " Never Ask  K2.8 Preview thinking: max  \xe2\x80\xa6/repo/ledger-fixture  main",
+            "                                                       context: 1% (364/1M)",
+        ]
+        echo_clean = [pyte_ansi.strip_sgr(ln).rstrip() for ln in echo_rows]
+        mid = provider.get_status_from_styled_screen(echo_rows, echo_clean)
+        assert mid is TerminalStatus.PROCESSING  # echo, no answer yet
+        assert provider._styled_turn_echo_seen is True
+        assert provider.get_status_from_styled_screen(raw_rows, clean_rows) is (
+            TerminalStatus.COMPLETED
+        )
+
+    def test_new_dispatch_resets_the_echo_latch(self):
+        raw_rows, clean_rows = self._styled_rows()
+        provider = _code_provider("echo-scrolled-reset")
+        provider._styled_turn_echo_seen = True
+        provider.mark_input_received()
+        assert provider._styled_turn_echo_seen is False
+        assert provider.get_status_from_styled_screen(raw_rows, clean_rows) is (
+            TerminalStatus.PROCESSING
+        )
